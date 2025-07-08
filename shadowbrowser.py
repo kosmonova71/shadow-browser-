@@ -1,4 +1,8 @@
 import os
+
+if "GST_PLUGIN_SCANNER" in os.environ:
+    del os.environ["GST_PLUGIN_SCANNER"]
+
 import json
 import ssl
 import gi
@@ -250,7 +254,7 @@ class AdBlocker:
 
     def inject_adblock_script_to_ucm(self, user_content_manager):
         """
-        Injects JavaScript into UserContentManager to block ads and handle special links.
+        Injects JavaScript into UserContentManager to block ads and handle void links.
         """
         adblock_script = r"""
         (function() {
@@ -333,25 +337,46 @@ class AdBlocker:
         })();
         """
         custom_script = r"""
-        document.addEventListener('click', function(event) {
-            let target = event.target;
-            while (target && target.tagName !== 'A') {
-                target = target.parentElement;
-            }
-            if (target && target.tagName === 'A') {
-                const href = target.getAttribute('href');
-                if (href && href.trim().toLowerCase() === 'javascript:void(0)') {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    const url = target.getAttribute('data-url');
-                    if (url) {
-                        window.open(url, '_blank');
-                    } else {
-                        console.warn('No data-url specified for this link.');
+        // Inject a script to handle void(0) links
+        (function() {
+            window.addEventListener('click', function(event) {
+                // Look for void(0) links with onclick handlers
+                let target = event.target;
+                while (target && target.tagName !== 'A') {
+                    target = target.parentElement;
+                }
+                if (target && target.tagName === 'A') {
+                    const href = target.getAttribute('href');
+                    if (href && href.trim().toLowerCase() === 'javascript:void(0)') {
+                        // Prevent default behavior
+                        event.preventDefault();
+                        event.stopPropagation();
+
+                        // Get the onclick handler
+                        const onclick = target.getAttribute('onclick');
+                        if (onclick) {
+                            // Look for dbneg function call
+                            const match = onclick.match(/dbneg\(['"]([^'"]+)['"]\)/);
+                            if (match) {
+                                const id = match[1];
+                                console.log('Found dbneg ID:', id);
+
+                                // Construct the URL using the dbneg function
+                                const url = window.dbneg(id);
+                                console.log('Constructed URL:', url);
+
+                                // Send the URL to Python
+                                if (url && url !== 'about:blank' && url !== window.location.href) {
+                                    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.voidLinkClicked) {
+                                        window.webkit.messageHandlers.voidLinkClicked.postMessage(url);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            }
-        }, true);
+            }, true);
+        })();
         """
         user_content_manager.add_script(
             WebKit.UserScript.new(
@@ -548,9 +573,105 @@ class ShadowBrowser(Gtk.Application):
         self.content_manager = WebKit.UserContentManager()
         self.context = ssl.create_default_context()
         self.adblocker = AdBlocker()
+        self.adblocker.disable() 
         self.debug_mode = True
         self.error_handlers = {}
         self.register_error_handlers()
+        self.download_spinner = Gtk.Spinner()
+        self.download_spinner.set_visible(False)
+        try:
+            self.adblocker.inject_to_webview(self.content_manager)
+            self.content_manager.register_script_message_handler("voidLinkClicked")
+            self.content_manager.connect("script-message-received::voidLinkClicked", self.on_void_link_clicked)
+            test_script = WebKit.UserScript.new(
+                "console.log('Test script injected into shared content manager');",
+                WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                WebKit.UserScriptInjectionTime.START,
+            )
+            self.content_manager.add_script(test_script)
+        except Exception as e:
+            print(f"AdBlock injection error in shared content manager: {e}")
+        self.inject_mouse_event_script()
+
+    def uuid_to_token(self, uuid_str: str) -> str:
+        """
+        Convert a UUID string to a short base64url token.
+        """
+        import base64
+        import uuid
+        try:
+            u = uuid.UUID(uuid_str)
+            b = u.bytes
+            token = base64.urlsafe_b64encode(b).rstrip(b'=').decode('ascii')
+            return token
+        except Exception as e:
+            logger.error(f"Error converting UUID to token: {e}")
+            return uuid_str
+
+    def transform_embed_selector_links(self, html_content: str) -> str:
+        """
+        Transform UUIDs in <a> tags with class 'embed-selector asg-hover even' and onclick handlers
+        by replacing UUIDs with short tokens in the onclick attribute.
+        """
+        import re
+
+        def replace_uuid(match):
+            original = match.group(0)
+            uuid_str = match.group(1)
+            token = self.uuid_to_token(uuid_str)
+            replaced = original.replace(uuid_str, token)
+            return replaced
+        pattern = r"onclick=\"window\.open\(dbneg\('([0-9a-fA-F\-]+)'\)"
+        transformed_html = re.sub(pattern, replace_uuid, html_content)
+        return transformed_html
+
+    def dbneg(self, id_string: str) -> str:
+        """
+        Python equivalent of the JavaScript dbneg function.
+        Constructs a URL with the given IDs as a query parameter.
+        """
+        base_url = "https://example.com/dbneg?ids="
+        import urllib.parse
+        encoded_ids = urllib.parse.quote(id_string)
+        return base_url + encoded_ids
+
+    def get_current_webview(self):
+        """Return the webview of the currently active tab."""
+        current_page = self.notebook.get_current_page()
+        if current_page == -1:
+            return None
+        child = self.notebook.get_nth_page(current_page)
+        if child is None:
+            return None
+        if isinstance(child, Gtk.ScrolledWindow):
+            inner_child = child.get_child()
+            if isinstance(inner_child, Gtk.Viewport):
+                webview = inner_child.get_child()
+                return webview
+            return inner_child
+        if isinstance(child, WebKit.WebView):
+            return child
+        return None
+
+    def create_secure_webview(self):
+        webview = WebKit.WebView(user_content_manager=self.content_manager)
+        settings = webview.get_settings()
+        settings.set_property("enable-javascript", True)
+        settings.set_property("enable-media-stream", True)
+        settings.set_property("enable-webgl", True)
+        self.setup_webview_settings(webview)
+        self.download_manager.add_webview(webview)
+        return webview
+
+    def on_void_link_clicked(self, user_content_manager, js_message):
+        try:
+            url = js_message.to_string()
+            logger.info(f"Final URL received: {url}")
+            if url and url != 'about:blank':
+                logger.info(f"Opening URL in new tab: {url}")
+                self.open_url_in_new_tab(url)
+        except Exception as e:
+            logger.error(f"Error handling voidLinkClicked message: {e}")
 
     def setup_webview_settings(self, webview):
         """Configure WebView settings for security and compatibility."""
@@ -570,16 +691,38 @@ class ShadowBrowser(Gtk.Application):
         settings.set_javascript_can_open_windows_automatically(True)
         settings.set_media_playback_requires_user_gesture(False)
 
-    def get_current_webview(self):
-        current_page = self.notebook.get_current_page()
-        if current_page != -1 and current_page < len(self.tabs):
-            return self.tabs[current_page].webview
-        return None
-
-    def get_toolbar(self):
-        if hasattr(self, "toolbar"):
-            return self.toolbar
-        return None
+    def inject_mouse_event_script(self):
+        """Injects JavaScript to capture mouse events in webviews."""
+        script = WebKit.UserScript.new(
+            """
+            (function() {
+                document.addEventListener('click', function(e) {
+                    let target = e.target;
+                    while (target && target.tagName !== 'A') {
+                        target = target.parentElement;
+                    }
+                    if (target && target.tagName === 'A') {
+                        const href = target.getAttribute('href');
+                        if (href && href.trim().toLowerCase() === 'javascript:void(0)') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const dataUrl = target.getAttribute('data-url');
+                            if (dataUrl) {
+                                // Instead of opening new tab here, send message to Python side
+                                const clickEvent = new CustomEvent('voidLinkClicked', { detail: { href: dataUrl } });
+                                target.dispatchEvent(clickEvent);
+                            } else {
+                                console.warn('No data-url specified for this link. No action taken.');
+                            }
+                        }
+                    }
+                }, true);
+            })();
+            """,
+            WebKit.UserContentInjectedFrames.ALL_FRAMES,
+            WebKit.UserScriptInjectionTime.START,
+        )
+        self.content_manager.add_script(script)
 
     def create_toolbar(self):
         if hasattr(self, "toolbar") and self.toolbar is not None:
@@ -616,6 +759,12 @@ class ShadowBrowser(Gtk.Application):
         new_tab_button = Gtk.Button.new_from_icon_name("tab-new")
         new_tab_button.connect("clicked", self.on_new_tab_clicked)
         self.toolbar.append(new_tab_button)
+        self.toolbar.append(self.download_spinner)
+        self.download_spinner.set_halign(Gtk.Align.END)
+        self.download_spinner.set_valign(Gtk.Align.CENTER)
+        self.download_spinner.set_margin_start(10)
+        self.download_spinner.set_margin_end(10)
+        self.download_spinner.set_visible(False)
         return self.toolbar
 
     def _show_bookmarks_menu(self, button=None):
@@ -701,6 +850,7 @@ class ShadowBrowser(Gtk.Application):
         self.update_bookmarks_menu(self.bookmark_menu)
         bookmark_popover.set_child(self.bookmark_menu)
         bookmark_menu_button.set_popover(bookmark_popover)
+        bookmark_popover.connect("closed", lambda popover: popover.set_visible(False))
         menubar.append(bookmark_menu_button)
         about_button = Gtk.Button(label="About")
         about_button.connect("clicked", self.on_about)
@@ -841,8 +991,7 @@ class ShadowBrowser(Gtk.Application):
         about.set_comments("A privacy-focused web browser")
         about.set_website("https://github.com/shadowyfigure/shadow-browser")
         about.set_logo_icon_name("web-browser")
-        about.connect("response", lambda d, r: d.destroy())
-        about.show()
+        about.present()
 
     def on_back_clicked(self, button):
         """Handle back button click."""
@@ -874,6 +1023,9 @@ class ShadowBrowser(Gtk.Application):
         tab = Tab(url, webview)
         tab.label_widget = label
         self.tabs.append(tab)
+        webview.connect("load-changed", self.on_load_changed)
+        webview.connect("notify::title", self.on_title_changed)
+        webview.connect("decide-policy", self.on_decide_policy)
 
     def on_tab_close_clicked(self, button, webview):
         """Close the tab associated with the given webview."""
@@ -894,15 +1046,19 @@ class ShadowBrowser(Gtk.Application):
             current_webview = self.get_current_webview()
             if webview == current_webview:
                 self.url_entry.set_text(webview.get_uri() or "")
+            GLib.idle_add(self.download_spinner.start)
+            GLib.idle_add(lambda: self.download_spinner.set_visible(True))
         elif load_event == WebKit.LoadEvent.FINISHED:
             logger.info(f"Page load finished: {webview.get_uri()}")
+            GLib.idle_add(self.download_spinner.stop)
+            GLib.idle_add(lambda: self.download_spinner.set_visible(False))
 
     def on_title_changed(self, webview, param):
         """Update tab label when page title changes."""
         max_length = 10
         title = webview.get_title() or "Untitled"
         if len(title) > max_length:
-            title = title[:max_length - 10] + "..."
+            title = title[:max_length - 3] + "..."
         for i, tab in enumerate(self.tabs):
             if tab.webview == webview and tab.label_widget is not None:
                 tab.label_widget.set_text(title)
@@ -938,12 +1094,17 @@ class ShadowBrowser(Gtk.Application):
     def on_decide_policy(self, webview, decision, decision_type):
         """Handle navigation policy decisions."""
         try:
+            from gi.repository import WebKit
             if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
                 navigation_action = decision.get_navigation_action()
                 request = navigation_action.get_request()
                 url = request.get_uri()
                 if not url:
                     logger.warning("Navigation request has no URL")
+                    decision.ignore()
+                    return True
+                if url.lower() == "javascript:void(0)":
+                    logger.info("Ignoring navigation to javascript:void(0)")
                     decision.ignore()
                     return True
                 if self.adblocker.is_blocked(url):
@@ -964,6 +1125,7 @@ class ShadowBrowser(Gtk.Application):
                     if navigation_action is None:
                         logger.warning("Navigation action is None in NEW_WINDOW_ACTION")
                         decision.ignore()
+                        return True
                     request = navigation_action.get_request()
                     if request is None:
                         logger.warning("Request is None in NEW_WINDOW_ACTION")
@@ -972,6 +1134,10 @@ class ShadowBrowser(Gtk.Application):
                     url = request.get_uri()
                     if url is None:
                         logger.warning("URL is None in NEW_WINDOW_ACTION")
+                        decision.ignore()
+                        return True
+                    if url.lower() == "javascript:void(0)":
+                        logger.info("Ignoring void(0) new window action")
                         decision.ignore()
                         return True
                     if any(url.lower().endswith(ext) for ext in DOWNLOAD_EXTENSIONS):
@@ -998,7 +1164,6 @@ class ShadowBrowser(Gtk.Application):
                     decision.ignore()
                     return True
             else:
-                logger.info("Handling other decision type")
                 decision.use()
                 return False
         except Exception as ex:
@@ -1010,15 +1175,14 @@ class ShadowBrowser(Gtk.Application):
         """Add download spinner to toolbar."""
         if toolbar:
             toolbar.append(self.download_spinner)
-            self.download_spinner.set_halign(Gtk.Align.CENTER)
-            self.download_spinner.set_valign(Gtk.Align.CENTER)
+            self.download_spinner.set_halign(Gtk.Align.END)
+            self.download_spinner.set_valign(Gtk.Align.END)
             self.download_spinner.set_margin_start(10)
             self.download_spinner.set_margin_end(10)
-            self.download_spinner.show()
+            self.download_spinner.set_visible(True)
 
     def start_manual_download(self, url):
         """Manually download a file from the given URL."""
-        import threading
         import requests
         from urllib.parse import urlparse
 
@@ -1063,7 +1227,6 @@ class ShadowBrowser(Gtk.Application):
                         'cancelled': False
                     }
                     self.download_manager.add_progress_bar(progress_info)
-                    
                     try:
                         with open(filepath, 'wb') as f:
                             for chunk in response.iter_content(block_size):
@@ -1231,29 +1394,27 @@ class ShadowBrowser(Gtk.Application):
         except Exception as e:
             logger.error(f"JavaScript evaluation error: {e}")
 
+    def test_js_execution(self):
+        webview = self.get_current_webview()
+        if webview:
+            js_code = "console.log('Test JS execution in webview'); 'JS executed';"
+            webview.evaluate_javascript(js_code, self.js_callback)
+        else:
+            logger.warning("No active webview to test JS execution.")
+
     def open_url_in_new_tab(self, url):
         new_webview = self.create_secure_webview()
         new_webview.load_uri(url)
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_vexpand(True)
+        scrolled_window.set_child(new_webview)
         label = Gtk.Label(label="Loading...")
-        self.notebook.append_page(new_webview, label)
-        self.notebook.set_current_page(-1)
-
-    def create_secure_webview(self):
-        webview = WebKit.WebView()
-        settings = webview.get_settings()
-        settings.set_property("enable-javascript", True)
-        settings.set_property("enable-media-stream", True)
-        settings.set_property("enable-webgl", True)
-        self.setup_webview_settings(webview)
-        self.download_manager.add_webview(webview)
-        try:
-            self.adblocker.inject_to_webview(webview.get_user_content_manager())
-        except Exception as e:
-            logger.error(f"AdBlock injection error: {e}")
-        webview.connect("load-changed", self.on_load_changed)
-        webview.connect("notify::title", self.on_title_changed)
-        webview.connect("decide-policy", self.on_decide_policy)
-        return webview
+        index = self.notebook.append_page(scrolled_window, label)
+        self.notebook.set_current_page(index)
+        new_webview.connect("load-changed", self.on_load_changed)
+        new_webview.connect("notify::title", self.on_title_changed)
+        new_webview.connect("decide-policy", self.on_decide_policy)
+        new_webview.connect("create", self.on_webview_create)
 
     def add_webview_to_tab(self, webview):
         scrolled_window = Gtk.ScrolledWindow()
@@ -1271,6 +1432,9 @@ class ShadowBrowser(Gtk.Application):
         tab.label_widget = label
         self.tabs.append(tab)
         self.notebook.set_current_page(index)
+        webview.connect("load-changed", self.on_load_changed)
+        webview.connect("notify::title", self.on_title_changed)
+        webview.connect("decide-policy", self.on_decide_policy)
 
     def open_popup_window(self, webview, window_features):
         window = Gtk.Window(title="Popup")
@@ -1300,7 +1464,7 @@ class ShadowBrowser(Gtk.Application):
         if not webview:
             logger.error("No active webview to load HTML.")
             return
-        
+
 if __name__ == "__main__":
     app = ShadowBrowser()
     app.run(None)
