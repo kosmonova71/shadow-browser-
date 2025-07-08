@@ -29,15 +29,19 @@ On Debian/Ubuntu-based systems, you can install dependencies with:
 
 ```bash
 sudo apt update
-sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-webkit2-6.0 gir1.2-gdkpixbuf-2.0 gir1.2-glib-2.0
-pip3 install cryptography requests
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-webkit2-6.0 gir1.2-gdkpixbuf-2.0 gir1.2-glib-2.0 python3-requests python3-cryptography
 ```
 
 On Fedora-based systems, you can install dependencies with:
 
 ```bash
-sudo dnf install python3-gobject gtk4 webkit2gtk3 gdk-pixbuf2 glib2
-pip3 install cryptography requests
+sudo dnf install python3-gobject gtk4 webkit2gtk6 gdk-pixbuf2 glib2 python3-requests python3-cryptography
+```
+
+On Arch Linux, you can install dependencies with:
+
+```bash
+sudo pacman -S python-gobject gtk4 webkit2gtk gdk-pixbuf2 glib2 python-requests python-cryptography
 ```
 
 ### Clone the repository
@@ -52,7 +56,7 @@ cd shadow-browser
 Run the browser with:
 
 ```bash
-python3 shadowbrowser2.py
+python3 shadowbrowser.py
 ```
 
 The browser will open with a default homepage (DuckDuckGo). Use the toolbar to navigate, open new tabs, add bookmarks, and manage downloads.
@@ -69,5 +73,5 @@ This project is licensed under the MIT License.
 
 ## Author
 
-ShadowyFigure  
+Andrew Power AKA -ShadowyFigure  
 https://github.com/shadowyfigure/shadow-browser
