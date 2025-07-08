@@ -573,7 +573,7 @@ class ShadowBrowser(Gtk.Application):
         self.content_manager = WebKit.UserContentManager()
         self.context = ssl.create_default_context()
         self.adblocker = AdBlocker()
-        self.adblocker.disable() 
+        self.adblocker.disable()
         self.debug_mode = True
         self.error_handlers = {}
         self.register_error_handlers()
@@ -990,7 +990,18 @@ class ShadowBrowser(Gtk.Application):
         about.set_copyright(" 2025 ShadowyFigure")
         about.set_comments("A privacy-focused web browser")
         about.set_website("https://github.com/shadowyfigure/shadow-browser")
-        about.set_logo_icon_name("web-browser")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        image_path = os.path.join(script_dir, "background.png")
+        try:
+            if os.path.exists(image_path):
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
+                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+                about.set_logo(texture)
+            else:
+                logger.warning(f"Logo file not found: {image_path}")
+                about.set_logo_icon_name("web-browser")
+        except Exception as e:
+            logger.error(f"Failed to load image: {e}")
         about.present()
 
     def on_back_clicked(self, button):
@@ -1027,16 +1038,34 @@ class ShadowBrowser(Gtk.Application):
         webview.connect("notify::title", self.on_title_changed)
         webview.connect("decide-policy", self.on_decide_policy)
 
-    def on_tab_close_clicked(self, button, webview):
-        """Close the tab associated with the given webview."""
-        page_num = None
-        for i, tab in enumerate(self.tabs):
-            if tab.webview == webview:
-                page_num = i
-                break
-        if page_num is not None:
-            self.notebook.remove_page(page_num)
-            self.tabs.pop(page_num)
+    def on_tab_close_clicked(self, button, tab_index):
+        """Close the tab at the given index."""
+        logger.info(f"Close button clicked for tab index: {tab_index}")
+        if 0 <= tab_index < len(self.tabs):
+            tab = self.tabs[tab_index]
+            webview = tab.webview
+            notebook_page_num = None
+            for page_index in range(self.notebook.get_n_pages()):
+                page = self.notebook.get_nth_page(page_index)
+                logger.info(f"Checking notebook page {page_index} for webview")
+                if isinstance(page, Gtk.ScrolledWindow):
+                    child = page.get_child()
+                    if child == webview or (isinstance(child, Gtk.Viewport) and child.get_child() == webview):
+                        notebook_page_num = page_index
+                        logger.info(f"Found notebook page {notebook_page_num} for webview")
+                        break
+            if notebook_page_num is not None:
+                logger.info(f"Removing notebook page {notebook_page_num}")
+                self.notebook.remove_page(notebook_page_num)
+            else:
+                logger.warning("Notebook page for webview not found")
+            self.tabs.pop(tab_index)
+            logger.info(f"Removed tab at index {tab_index}")
+            try:
+                webview.unparent()
+                logger.info("Webview unparented successfully")
+            except Exception as e:
+                logger.error(f"Error unparenting webview on tab close: {e}")
 
     def on_load_changed(self, webview, load_event):
         """Handle load state changes."""
@@ -1080,19 +1109,37 @@ class ShadowBrowser(Gtk.Application):
                 new_webview.connect("decide-policy", self.on_decide_policy)
                 new_webview._decide_policy_connected = True
             if window_features:
-                if window_features.get("modal"):
-                    new_webview.set_modal(True)
-                if window_features.get("width") and window_features.get("height"):
-                    new_webview.set_size_request(window_features.get("width"), window_features.get("height"))
-            logger.info("Opening in new tab.")
-            self.add_webview_to_tab(new_webview)
+                try:
+                    if hasattr(window_features, "get") and callable(window_features.get):
+                        if window_features.get("modal"):
+                            new_webview.set_modal(True)
+                        width = window_features.get("width")
+                        height = window_features.get("height")
+                        if width and height:
+                            new_webview.set_size_request(width, height)
+                    else:
+                        logger.warning("window_features does not have a get method")
+                except Exception as wf_exc:
+                    logger.error(f"Exception accessing window_features: {wf_exc}")
+            is_popup = False
+            try:
+                if window_features and hasattr(window_features, "get") and callable(window_features.get):
+                    is_popup = window_features.get("popup", False)
+            except Exception as e:
+                logger.error(f"Error checking popup flag in window_features: {e}")
+            if is_popup:
+                logger.info("Opening in popup window.")
+                self.open_popup_window(new_webview, window_features)
+            else:
+                logger.info("Opening in new tab.")
+                self.add_webview_to_tab(new_webview)
             return new_webview
         except Exception as e:
             logger.error(f"Error in on_webview_create: {e}")
             return None
 
     def on_decide_policy(self, webview, decision, decision_type):
-        """Handle navigation policy decisions."""
+        """Handle navigation and new window actions, manage downloads, and apply adblocker policies."""
         try:
             from gi.repository import WebKit
             if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
@@ -1227,6 +1274,7 @@ class ShadowBrowser(Gtk.Application):
                         'cancelled': False
                     }
                     self.download_manager.add_progress_bar(progress_info)
+                    
                     try:
                         with open(filepath, 'wb') as f:
                             for chunk in response.iter_content(block_size):
@@ -1409,7 +1457,23 @@ class ShadowBrowser(Gtk.Application):
         scrolled_window.set_vexpand(True)
         scrolled_window.set_child(new_webview)
         label = Gtk.Label(label="Loading...")
-        index = self.notebook.append_page(scrolled_window, label)
+        close_button = Gtk.Button.new_from_icon_name("window-close")
+        close_button.set_size_request(24, 24)
+        close_button.set_tooltip_text("Close tab")
+        
+        def on_close_clicked(button):
+            try:
+                tab_index = self.tabs.index(tab)
+                self.on_tab_close_clicked(button, tab_index)
+            except ValueError:
+                logger.warning("Tab not found for close button")
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        box.append(label)
+        box.append(close_button)
+        index = self.notebook.append_page(scrolled_window, box)
+        tab = Tab(url, new_webview)
+        self.tabs.append(tab)
+        close_button.connect("clicked", on_close_clicked)
         self.notebook.set_current_page(index)
         new_webview.connect("load-changed", self.on_load_changed)
         new_webview.connect("notify::title", self.on_title_changed)
@@ -1423,7 +1487,12 @@ class ShadowBrowser(Gtk.Application):
         label = Gtk.Label(label=self.extract_tab_title(webview.get_uri()))
         close_button = Gtk.Button.new_from_icon_name("window-close")
         close_button.set_size_request(24, 24)
-        close_button.connect("clicked", self.on_tab_close_clicked, webview)
+        def on_close_clicked(button):
+            try:
+                tab_index = self.tabs.index(tab)
+                self.on_tab_close_clicked(button, tab_index)
+            except ValueError:
+                logger.warning("Tab not found for close button")
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         box.append(label)
         box.append(close_button)
@@ -1431,6 +1500,7 @@ class ShadowBrowser(Gtk.Application):
         tab = Tab(webview.get_uri(), webview)
         tab.label_widget = label
         self.tabs.append(tab)
+        close_button.connect("clicked", on_close_clicked)
         self.notebook.set_current_page(index)
         webview.connect("load-changed", self.on_load_changed)
         webview.connect("notify::title", self.on_title_changed)
