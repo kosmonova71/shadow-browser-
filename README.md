@@ -33,6 +33,13 @@ sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-webkit2-6.0 gir1.2-gdkpixbuf-2
 pip3 install cryptography requests
 ```
 
+On Fedora-based systems, you can install dependencies with:
+
+```bash
+sudo dnf install python3-gobject gtk4 webkit2gtk3 gdk-pixbuf2 glib2
+pip3 install cryptography requests
+```
+
 ### Clone the repository
 
 ```bash
