@@ -1,9 +1,66 @@
-# shadow-browser  webkit gtk4
+# Shadow Browser
 
-Fedora
+Shadow Browser is a privacy-focused web browser built using Python, GTK4, and WebKit6. It offers a lightweight, secure, and customizable browsing experience with features designed to enhance user privacy and control.
 
-sudo dnf install python3-pip python3-gobject gtk4 webkitgtk6
+## Features
 
-pip install requests cryptography
+- Tabbed browsing with easy tab management
+- Bookmark and history management with JSON-based storage
+- Built-in ad blocker using EasyList patterns
+- Secure WebView settings with JavaScript, media, and WebGL support
+- Download manager with progress tracking and file conflict handling
+- Session saving and restoring for tabs and browsing state
+- Custom JavaScript injection for enhanced privacy and functionality
+- Content Security Policy (CSP) enforcement and mixed content blocking
+- Support for handling special links like `javascript:void(0)` with custom handlers
+- Dark theme support with GTK4 native theming
 
-Working yes you can run it - but it is far from finished
+## Installation
+
+### Prerequisites
+
+- Python 3.8 or higher
+- GTK 4 and its Python bindings (`python3-gi` with GTK4 support)
+- WebKit2GTK 6.0 and its Python bindings
+- Cryptography library for SSL certificate handling
+- Requests library for HTTP requests
+
+On Debian/Ubuntu-based systems, you can install dependencies with:
+
+```bash
+sudo apt update
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-webkit2-6.0 gir1.2-gdkpixbuf-2.0 gir1.2-glib-2.0
+pip3 install cryptography requests
+```
+
+### Clone the repository
+
+```bash
+git clone https://github.com/shadowyfigure/shadow-browser.git
+cd shadow-browser
+```
+
+## Usage
+
+Run the browser with:
+
+```bash
+python3 shadowbrowser2.py
+```
+
+The browser will open with a default homepage (DuckDuckGo). Use the toolbar to navigate, open new tabs, add bookmarks, and manage downloads.
+
+## Configuration
+
+- The ad blocker is disabled by default but can be enabled in the code (`ShadowBrowser` class, `adblocker.enable()`).
+- Bookmarks, history, session, and tabs are saved in JSON files in the working directory.
+- The theme can be toggled between dark and light by modifying the `self.theme` attribute in the `ShadowBrowser` class.
+
+## License
+
+This project is licensed under the MIT License.
+
+## Author
+
+ShadowyFigure  
+https://github.com/shadowyfigure/shadow-browser
