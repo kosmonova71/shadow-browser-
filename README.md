@@ -64,7 +64,6 @@ The browser will open with a default homepage (DuckDuckGo). Use the toolbar to n
 ## Configuration
 
 - Bookmarks, history, session, and tabs are saved in JSON files in the working directory.
-- The theme can be toggled between dark and light by modifying the `self.theme` attribute in the `ShadowBrowser` class.
 
 ## License
 
