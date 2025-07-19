@@ -73,5 +73,5 @@ This project is licensed under the MIT License.
 
 ## Author
 
-Andrew Power AKA -ShadowyFigure  
+Andrew Power
 https://github.com/shadowyfigure/shadow-browser
