@@ -1,14 +1,15 @@
-import os
+import datetime
 import json
-import ssl
-import gi
-import time
+import os
 import re
 import socket
+import ssl
 import threading
+import time
 import traceback
-from urllib.parse import urlparse, urlunparse
-import datetime
+from urllib.parse import urlparse, urlunparse, quote, unquote, parse_qs
+
+import gi
 import requests
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -19,7 +20,7 @@ gi.require_version('Gdk', '4.0')
 gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('GLib', '2.0')
 
-from gi.repository import Gtk, WebKit, Gdk, GdkPixbuf, GLib
+from gi.repository import Gtk, GLib, WebKit, GdkPixbuf, Gdk
 
 DOWNLOAD_EXTENSIONS = [
     ".3gp", ".7z", ".aac", ".apk", ".appimage", ".avi", ".bat", ".bin", ".bmp",
@@ -39,21 +40,15 @@ SESSION_FILE = "session.json"
 TABS_FILE = "tabs.json"
 HISTORY_LIMIT = 100
 
-# Import JavaScript obfuscation handler
 try:
-    # First try the improved version
     from js_obfuscation_improved import extract_url_from_javascript as js_extract_url
     from js_obfuscation_improved import extract_onclick_url
 
 except ImportError:
     try:
-        # Fall back to the basic version if improved is not available
         from js_obfuscation import extract_url_from_javascript as js_extract_url
-
         extract_onclick_url = None
-
     except ImportError:
-        # Fallback if no module is available
         js_extract_url = None
         extract_onclick_url = None
 
@@ -88,10 +83,8 @@ class SSLUtils:
     def is_certificate_expired(self, cert: x509.Certificate) -> bool:
         """
         Check if the certificate is expired.
-
         Args:
             cert (x509.Certificate): The X.509 certificate object.
-
         Returns:
             bool: True if the certificate is expired, False otherwise.
         """
@@ -109,10 +102,21 @@ class DownloadManager:
         self.on_download_start_callback = None
         self.on_download_finish_callback = None
 
+    def safe_append(self, container, widget):
+        """Append widget to container after unparenting if needed to avoid GTK warnings."""
+        if widget.get_parent() is not None:
+            try:
+                widget.unparent()
+            except Exception:
+                pass
+        container.append(widget)
+
     def add_webview(self, webview):
         """Connect download signals to the download manager."""
-        # This method can be implemented to connect webview download signals if needed
-        pass
+        try:
+            webview.connect("download-requested", self.on_download_requested)
+        except Exception:
+            pass
 
     def on_download_requested(self, context, download):
         """Handle download request event."""
@@ -142,9 +146,8 @@ class DownloadManager:
                 "progress": progress,
                 "filepath": filepath,
                 "status": "Downloading",
-                "cancelled": False
+                "cancelled": False,
             }
-            # Use safe_append to append widgets safely
             self.safe_append(hbox, label)
             self.safe_append(hbox, progress)
             self.safe_append(self.box, hbox)
@@ -164,10 +167,13 @@ class DownloadManager:
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         label = Gtk.Label(label=f"Downloading {progress_info['filename']}")
         progress = Gtk.ProgressBar()
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.set_tooltip_text("Cancel download")
         self.downloads[progress_info['filename']] = {
             "hbox": hbox,
             "label": label,
             "progress": progress,
+            "cancel_button": cancel_button,
             "filepath": os.path.join(
                 GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or 
                 os.path.expanduser("~/Downloads"),
@@ -176,10 +182,21 @@ class DownloadManager:
             "status": "Downloading",
             "cancelled": False
         }
-        # Use safe_append to append widgets safely
+        cancel_button.connect("clicked", lambda btn, info=progress_info: self.cancel_download(info))
         self.safe_append(hbox, label)
         self.safe_append(hbox, progress)
+        self.safe_append(hbox, cancel_button)
         self.safe_append(self.box, hbox)
+
+    def cancel_download(self, progress_info):
+        """Cancel a manual download."""
+        info = self.downloads.get(progress_info['filename'])
+        if info and not info["cancelled"]:
+            info["cancelled"] = True
+            info["label"].set_text(f"Download cancelled: {progress_info['filename']}")
+            info["progress"].set_text("Cancelled")
+            if self.on_download_finish_callback:
+                self.on_download_finish_callback()
 
     def update_progress(self, progress_info, progress):
         """Update progress for manual downloads."""
@@ -248,17 +265,10 @@ class DownloadManager:
                 if self.download_area.get_parent() is None:
                     parent_child.append(self.download_area)
                 else:
-                    # Defensive remove before append to avoid gtk_box_append assertion failure
                     parent = self.download_area.get_parent()
                     if parent and hasattr(parent, "remove"):
                         parent.remove(self.download_area)
                     parent_child.append(self.download_area)
-
-    def clear_all(self):
-        """Clear all completed downloads from the UI."""
-        for download, info in list(self.downloads.items()):
-            if info["status"] in ["Finished", "Failed", "Cancelled"]:
-                self.cleanup_download(download)
 
 class AdBlocker:
     def __init__(self):
@@ -268,7 +278,6 @@ class AdBlocker:
         self.cache_file = "easylist_cache.txt"
         self.cache_max_age = 86400
         self.adult_patterns = []
-
         self.load_block_lists()
 
     def inject_to_webview(self, user_content_manager):
@@ -282,16 +291,16 @@ class AdBlocker:
         (function() {
             const selectorsToHide = [
                 '.ad', '.ads', '.advert', '.advertisement', '.banner', '.promo', '.sponsored',
-                '[id*="ad-"]', '[id*="ads-"]', '[id*="advert-"]', '[id*="banner"]',
+                '[id*="ad-"]', '[id*="ads-"]', '[id*="advert-"]', '[id*="banner"]', '[id*="container"]',
                 '[class*="-ad"]', '[class*="-ads"]', '[class*="-advert"]', '[class*="-banner"]',
                 '[class*="adbox"]', '[class*="adframe"]', '[class*="adwrapper"]', '[class*="bannerwrapper"]',
                 '[class*="__wrap"]','[class*="__content"]','[class*="__btn-block"]',
                 '[src*="cdn.creative-sb1.com"]','[src*="cdn.storageimagedisplay.com"]',
-                'iframe[src*="ad"], iframe[src*="ads"]',
+                'iframe[src*="ad"]', 
                 'div[id^="google_ads_"]',
                 'div[class^="adsbygoogle"]',
                 'ins.adsbygoogle'
-            ];
+            ].filter(selector => !selector.includes('.player-container') && !selector.includes('#player'));
             function hideElements() {
                 selectorsToHide.forEach(selector => {
                     try {
@@ -429,6 +438,14 @@ class AdBlocker:
 
     def _parse_block_patterns(self, lines):
         """Parses block list rules into regex patterns."""
+        import pickle
+        cache_file = "block_patterns_cache.pkl"
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                pass
         compiled_patterns = []
         for line in lines:
             if any(s in line for s in ("##", "#@#", "@@")):
@@ -449,6 +466,11 @@ class AdBlocker:
                 compiled_patterns.append(regex)
             except re.error:
                 pass
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(compiled_patterns, f)
+        except Exception:
+            pass
         return compiled_patterns
 
     def is_blocked(self, url):
@@ -497,17 +519,25 @@ class AdBlocker:
         """
         Enable Content Security Policy on the webview with optional CSP string.
         Sanitizes the CSP string to remove unsupported directives like 'manifest-src'.
+        Merges with existing CSP if provided.
         """
+
+        default_csp = "default-src 'self'; script-src 'self' https://trusted.com;"
         if csp_policy is None:
-            csp_policy = "default-src 'self'; script-src 'self' https://trusted.com;"
-        # Remove 'manifest-src' directive if present
-        import re
+            csp_policy = default_csp
+        else:
+            csp_directives = set(d.strip() for d in csp_policy.split(';') if d.strip())
+            default_directives = set(d.strip() for d in default_csp.split(';') if d.strip())
+            merged_directives = default_directives.union(csp_directives)
+            csp_policy = '; '.join(sorted(merged_directives))
         sanitized_csp = re.sub(r'\bmanifest-src[^;]*;?', '', csp_policy, flags=re.IGNORECASE).strip()
-        # Remove trailing semicolon if any
         if sanitized_csp.endswith(';'):
             sanitized_csp = sanitized_csp[:-1].strip()
         settings = webview.get_settings()
-        settings.set_property("content-security-policy", sanitized_csp)
+        try:
+            settings.set_property("content-security-policy", sanitized_csp)
+        except Exception:
+            settings.set_property("content-security-policy", default_csp)
 
     def report_csp_violation(self, report):
         pass
@@ -544,7 +574,16 @@ class AdBlocker:
 
 class SocialTrackerBlocker:
     def __init__(self):
-        self.blocklist = ["twitter.com"]
+        self.blocklist = self.load_blocklist("social_trackers.txt")
+
+    def load_blocklist(self, filename):
+        try:
+            with open(filename, "r") as f:
+                return [line.strip() for line in f if line.strip()]
+        except FileNotFoundError:
+            return ["twitter.com", "facebook.com", "instagram.com"]
+        except Exception:
+            return ["twitter.com", "facebook.com", "instagram.com"]
 
     def block_trackers(self, webview, url):
         parsed_url = urlparse(url)
@@ -560,61 +599,75 @@ class Tab:
 
 class ShadowBrowser(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="com.shadowyfigure.shadowbrowser")
-        self.debug_mode = True
-        self.set_logging_level()
-        self.webview = WebKit.WebView()
-        self.content_manager = WebKit.UserContentManager()
-        self.adblocker = AdBlocker()
-        self.social_tracker_blocker = SocialTrackerBlocker()  # Added social tracker blocker instance
-        self.setup_webview_settings(self.webview)
-        self.webview.connect("create", self.on_webview_create)
-        self.bookmarks = self.load_json(BOOKMARKS_FILE)
-        self.history = self.load_json(HISTORY_FILE)
-        self.tabs = []
-        self.blocked_urls = []
-        self.window = None
-        self.notebook = Gtk.Notebook()
-        self.url_entry = Gtk.Entry()
-        self.home_url = "https://duckduckgo.com/"
-        self.theme = "dark"
-        self.download_manager = DownloadManager(None)  # Initialize with None, set later
-        self.active_downloads = 0
-        self.context = ssl.create_default_context()
-        self.error_handlers = {}
-        self.register_error_handlers()
-        self.download_spinner = Gtk.Spinner()
-        self.download_spinner.set_visible(False)
-
-        self.bookmark_menu = None  # Initialize bookmark_menu attribute
-        
-        # Setup security policies
-        self.setup_security_policies()
-        
-        # Setup download manager callbacks
-        self.download_manager.on_download_start_callback = self.on_download_start
-        self.download_manager.on_download_finish_callback = self.on_download_finish
-        
         try:
-            self.adblocker.inject_to_webview(self.content_manager)
-            self.inject_nonce_respecting_script()
-            self.inject_remove_malicious_links()
-            self.inject_adware_cleaner()
-            self.content_manager.register_script_message_handler("voidLinkClicked")
-            self.content_manager.connect("script-message-received::voidLinkClicked", self.on_void_link_clicked)
-            test_script = WebKit.UserScript.new(
-                "console.log('Test script injected into shared content manager');",
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit.UserScriptInjectionTime.START,
-            )
-            self.content_manager.add_script(test_script)
+            super().__init__(application_id="com.shadowyfigure.shadowbrowser")
+            self.debug_mode = True
+            self.content_manager = WebKit.UserContentManager()
+            self.webview = WebKit.WebView(user_content_manager=self.content_manager)
+            self.tabs = []
+            self.blocked_urls = []
+            self.window = None
+            self.notebook = Gtk.Notebook()
+            self.url_entry = Gtk.Entry()
+            self.home_url = "https://duckduckgo.com/"
+            self.theme = "dark"
+            self.adblocker = AdBlocker()
+            self.social_tracker_blocker = SocialTrackerBlocker()
+            self.setup_security_policies()
+            self.setup_webview_settings(self.webview)
+            self.webview.connect("create", self.on_webview_create)
+            self.bookmarks = self.load_json(BOOKMARKS_FILE) or {}
+            self.history = self.load_json(HISTORY_FILE) or []
+            self.download_manager = DownloadManager(None)
+            self.active_downloads = 0
+            self.download_spinner = Gtk.Spinner()
+            self.download_spinner.set_visible(False)
+            self.download_manager.on_download_start_callback = self.on_download_start
+            self.download_manager.on_download_finish_callback = self.on_download_finish
+            self.context = ssl.create_default_context()
+            self.context.set_ciphers('DEFAULT@SECLEVEL=1')
+            self.error_handlers = {}
+            self.register_error_handlers()
+            self.bookmark_menu = None
+            self.incognito_mode = False
+            try:
+                self.adblocker.inject_to_webview(self.content_manager)
+                self.inject_nonce_respecting_script()
+                self.inject_remove_malicious_links()
+                self.content_manager.register_script_message_handler("voidLinkClicked")
+                self.content_manager.connect(
+                    "script-message-received::voidLinkClicked", 
+                    self.on_void_link_clicked
+                )
+                test_script = WebKit.UserScript.new(
+                    "console.log('Shadow Browser initialized');",
+                    WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                    WebKit.UserScriptInjectionTime.START,
+                )
+                self.content_manager.add_script(test_script)
+                self.inject_wau_tracker_removal_script()
+                self.inject_mouse_event_script()
+                
+            except Exception:
+                pass
+            
         except Exception:
-            pass
+            raise
 
-        # Inject script to remove _wau analytics tracker (waust.at)
-        self.inject_wau_tracker_removal_script()
-
-        self.inject_mouse_event_script()
+    def toggle_incognito_mode(self, action=None, parameter=None):
+        self.incognito_mode = not self.incognito_mode
+        if self.incognito_mode:
+            self.history = []
+            self.save_json(HISTORY_FILE, [])
+            try:
+                pass
+            except Exception:
+                pass
+        else:
+            try:
+                pass
+            except Exception:
+                pass
 
     def inject_wau_tracker_removal_script(self):
         try:
@@ -663,7 +716,6 @@ class ShadowBrowser(Gtk.Application):
 
     def setup_security_policies(self):
         """Setup comprehensive security policies for the browser."""
-        # Block unsafe URLs
         self.blocked_urls.extend([
             "accounts.google.com/gsi/client",
             "facebook.com/connect",
@@ -678,21 +730,15 @@ class ShadowBrowser(Gtk.Application):
         if load_event == WebKit.LoadEvent.STARTED:
             uri = webview.get_uri()
             if uri and uri.startswith("http"):
-                # Block known unsafe scripts
                 if any(blocked_url in uri.lower() for blocked_url in self.blocked_urls):
                     return True
-                
-                # Set security headers in user agent
                 user_agent = webview.get_settings().get_user_agent()
                 webview.get_settings().set_user_agent(
                     f"{user_agent} SecurityBrowser/1.0"
                 )
-                
-                # Apply CSP directly
                 webview.get_settings().set_enable_javascript(True)
                 webview.get_settings().set_javascript_can_access_clipboard(False)
                 webview.get_settings().set_javascript_can_open_windows_automatically(False)
-                
                 return True
         return False
 
@@ -725,7 +771,6 @@ class ShadowBrowser(Gtk.Application):
         Transform UUIDs in <a> tags with class 'embed-selector asg-hover even' and onclick handlers
         by replacing UUIDs with short tokens in the onclick attribute.
         """
-        import re
 
         def replace_uuid(match):
             original = match.group(0)
@@ -743,8 +788,7 @@ class ShadowBrowser(Gtk.Application):
         Constructs a URL with the given IDs as a query parameter.
         """
         base_url = "https://example.com/dbneg?ids="
-        import urllib.parse
-        encoded_ids = urllib.parse.quote(id_string)
+        encoded_ids = quote(id_string)
         return base_url + encoded_ids
 
     def get_current_webview(self):
@@ -766,7 +810,8 @@ class ShadowBrowser(Gtk.Application):
         return None
 
     def create_secure_webview(self):
-        webview = WebKit.WebView(user_content_manager=self.content_manager)
+        context = WebKit.WebContext.get_default()
+        webview = WebKit.WebView(user_content_manager=self.content_manager, web_context=context)
         settings = webview.get_settings()
         settings.set_property("enable-javascript", True)
         settings.set_property("enable-media-stream", True)
@@ -787,11 +832,9 @@ class ShadowBrowser(Gtk.Application):
     def setup_webview_settings(self, webview):
         """Configure WebView settings for security and compatibility."""
         settings = webview.get_settings()
-        
-        # Security Settings
-        settings.set_enable_javascript(True)  # Required for web functionality
-        settings.set_enable_developer_extras(self.debug_mode)  # Only enable in debug mode
-        settings.set_enable_media_stream(True)  # Required for media playback
+        settings.set_enable_javascript(True)
+        settings.set_enable_developer_extras(self.debug_mode)
+        settings.set_enable_media_stream(True)
         settings.set_enable_media_capabilities(True)
         settings.set_enable_mediasource(True)
         settings.set_enable_smooth_scrolling(True)
@@ -799,17 +842,12 @@ class ShadowBrowser(Gtk.Application):
         settings.set_enable_webaudio(True)
         settings.set_allow_file_access_from_file_urls(False)
         settings.set_allow_universal_access_from_file_urls(False)
-        settings.set_allow_modal_dialogs(False)  # Disable modal dialogs for security
-        settings.set_javascript_can_access_clipboard(False)  # Disable clipboard access
-        settings.set_javascript_can_open_windows_automatically(False)  # Disable automatic window opening
-        settings.set_media_playback_requires_user_gesture(True)  # Allow autoplay and embedded videos without user gesture
-        
-        # Add security headers
+        settings.set_allow_modal_dialogs(False)
+        settings.set_javascript_can_access_clipboard(False) 
+        settings.set_javascript_can_open_windows_automatically(False)
+        settings.set_media_playback_requires_user_gesture(False) 
         webview.connect("load-changed", self.inject_security_headers)
-        
-        # Enable social tracker blocking
         webview.connect("decide-policy", self.block_social_trackers)
-        
         return webview
     
     def inject_mouse_event_script(self):
@@ -896,26 +934,16 @@ class ShadowBrowser(Gtk.Application):
             return
         try:
             if popover.get_visible():
-                # Already visible, do nothing
                 return
-            # Defensive unparenting of popover child if needed
             child = popover.get_child()
             if child and child.get_parent() is not None and child.get_parent() != popover:
                 try:
                     child.get_parent().remove(child)
                 except Exception:
                     pass
-
-            # Ensure popover is associated with its parent widget properly
             parent = popover.get_parent()
             if parent is None:
-                # Try to set the popover's parent to the widget it should be attached to
-                # This is a defensive measure to avoid broken active state warnings
-                # Usually, popover should be set as a child of a Gtk.MenuButton or similar
-                # If no parent, do nothing
-
                 pass
-
             popover.popup()
         except Exception:
             pass
@@ -931,7 +959,11 @@ class ShadowBrowser(Gtk.Application):
                         return
 
     def do_startup(self):
-        Gtk.Application.do_startup(self)
+        """Initialize the application."""
+        try:
+            Gtk.Application.do_startup(self)
+        except Exception:
+            raise
 
     def do_activate(self):
         """Create and show the main window."""
@@ -940,41 +972,29 @@ class ShadowBrowser(Gtk.Application):
                 self.window = Gtk.ApplicationWindow(application=self)
                 self.window.set_title("Shadow Browser")
                 self.window.set_default_size(1200, 800)
-                
-                # Create main container
-                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-                
-                # Create menubar
-                menubar = self.create_menubar()
-                self.safe_append(vbox, menubar)
-                
-                # Create toolbar
-                toolbar = self.create_toolbar()
-                self.safe_append(vbox, toolbar)
-                
-                # Add notebook for tabs
-                self.safe_append(vbox, self.notebook)
-                
-                # Set parent window for download manager now that window exists
-                self.download_manager.parent_window = self.window
-                
-                # Add download manager
-                self.download_manager.show()
-                self.safe_append(vbox, self.download_manager.box)
-                
-                # Set window content
-                self.window.set_child(vbox)
-                
-                # Connect window close event
-                self.window.connect("close-request", self.on_window_destroy)
-                
-                # Add initial tab
-                self.add_new_tab(self.home_url)
-                
+                vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+                try:
+                    menubar = self.create_menubar()
+                    if menubar:
+                        self.safe_append(vbox, menubar)
+                    toolbar = self.create_toolbar()
+                    if toolbar:
+                        self.safe_append(vbox, toolbar)
+                    if hasattr(self, 'notebook') and self.notebook:
+                        self.safe_append(vbox, self.notebook)
+                    if hasattr(self, 'download_manager') and self.download_manager:
+                        self.download_manager.parent_window = self.window
+                        self.download_manager.show()
+                        self.safe_append(vbox, self.download_manager.box)
+                    self.window.set_child(vbox)
+                    self.window.connect("close-request", self.on_window_destroy)
+                    self.add_new_tab(self.home_url)
+                    self.apply_theme()
+                except Exception:
+                    return
             self.window.present()
-
         except Exception:
-            pass
+            raise
 
     def do_shutdown(self):
         """Save session and tabs before shutdown."""
@@ -1005,46 +1025,132 @@ class ShadowBrowser(Gtk.Application):
 
     def toggle_debug_mode(self, action=None, parameter=None):
         self.debug_mode = not self.debug_mode
-        self.set_logging_level()
 
     def set_logging_level(self):
         pass
 
+    def toggle_adblocker(self, action=None, parameter=None):
+        self.adblocker.enabled = not self.adblocker.enabled
+
+    def set_search_engine(self, engine_url):
+        self.search_engine = engine_url
+
+    def on_close_current_tab(self, action, parameter):
+        current_page = self.notebook.get_current_page()
+        if current_page != -1:
+            self.on_tab_close_clicked(None, current_page)
+
+    def _close_bookmark_popover(self):
+        """Helper to close the bookmarks popover."""
+        if hasattr(self, 'bookmark_popover') and self.bookmark_popover:
+            self.bookmark_popover.popdown()
+    
+    def _on_key_pressed(self, controller, keyval, keycode, state):
+        """Handle keyboard shortcuts."""
+        from gi.repository import Gdk
+        ctrl = (state & Gdk.ModifierType.CONTROL_MASK)
+        shift = (state & Gdk.ModifierType.SHIFT_MASK)
+        if ctrl and shift and keyval == Gdk.KEY_b:
+            self.test_bookmarks_menu()
+            return True
+        return False
+        
+    def _clear_all_bookmarks(self, button=None):
+        """Clear all bookmarks."""
+        self.bookmarks.clear()
+        self.save_json(BOOKMARKS_FILE, self.bookmarks)
+        self.update_bookmarks_menu(self.bookmark_menu)
+        self._close_bookmark_popover()
+
     def create_menubar(self):
         menubar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        bookmark_menu_button = Gtk.MenuButton(label="Bookmarks")
-        bookmark_popover = Gtk.Popover()
-
-        # Defensive unparenting before setting child
-        if self.bookmark_menu is not None:
-            try:
-                if self.bookmark_menu.get_parent() is not None:
-                    self.bookmark_menu.get_parent().remove(self.bookmark_menu)
-            except Exception:
-                pass
-        else:
-            self.bookmark_menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-
+        self.bookmark_menu_button = Gtk.MenuButton(label="Bookmarks")
+        self.bookmark_menu_button.set_tooltip_text("Show bookmarks")
+        self.bookmark_popover = Gtk.Popover()
+        self.bookmark_popover.set_size_request(300, -1)
+        if not hasattr(self, 'bookmark_menu') or self.bookmark_menu is None:
+            self.bookmark_menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         self.update_bookmarks_menu(self.bookmark_menu)
-        bookmark_popover.set_child(self.bookmark_menu)
-        bookmark_menu_button.set_popover(bookmark_popover)
-        # Connect popover closed signal to hide popover safely
-        bookmark_popover.connect("closed", lambda popover: popover.set_visible(False))
-        self.safe_append(menubar, bookmark_menu_button)
+        self.bookmark_popover.set_child(self.bookmark_menu)
+        self.bookmark_menu_button.set_popover(self.bookmark_popover)
+        self.bookmark_popover.connect("closed", lambda popover: popover.set_visible(False))
+        self.safe_append(menubar, self.bookmark_menu_button)
+        if hasattr(self, 'window') and self.window:
+            shortcut_controller = Gtk.EventControllerKey()
+            shortcut_controller.connect("key-pressed", self._on_key_pressed)
+            self.window.add_controller(shortcut_controller)
+        download_button = Gtk.Button(label="Downloads")
+        download_button.set_tooltip_text("Open Downloads Folder")
+        download_button.connect("clicked", self.on_downloads_clicked)
+        self.safe_append(menubar, download_button)
         about_button = Gtk.Button(label="About")
         about_button.connect("clicked", self.on_about)
         self.safe_append(menubar, about_button)
         return menubar
 
+    def on_downloads_clicked(self, button):
+        """Open the downloads folder in the system file manager."""
+        downloads_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
+        if not downloads_dir:
+            downloads_dir = os.path.expanduser("~/Downloads")
+        try:
+            import subprocess
+            subprocess.Popen(["xdg-open", downloads_dir])
+        except Exception:
+            self.show_error_message("Failed to open downloads folder.")
+
     def on_search_activate(self, search_entry):
+        """Handle search/URL entry with enhanced features.
+        Supports:
+        - Direct URL loading with auto-correction
+        - Search with default search engine
+        - Search engine shortcuts (e.g., 'g searchterm' for Google)
+        - Common URL typos correction
+        """
         query = search_entry.get_text().strip()
         if not query:
             return
+        search_engines = {
+            'g': 'https://www.google.com/search?q={}',
+            'ddg': 'https://duckduckgo.com/?q={}',
+            'yt': 'https://www.youtube.com/results?search_query={}',
+            'gh': 'https://github.com/search?q={}'
+        }
+        if ' ' in query:
+            prefix = query.split(' ', 1)[0].lower()
+            if prefix in search_engines:
+                search_term = query.split(' ', 1)[1]
+                search_url = search_engines[prefix].format(requests.utils.quote(search_term))
+                self.load_url(search_url)
+                return
         if self.is_valid_url(query):
             self.load_url(query)
-        else:
-            search_url = f"https://duckduckgo.com/?q={requests.utils.quote(query)}"
-            self.load_url(search_url)
+            return
+        corrected_url = self.attempt_url_correction(query)
+        if corrected_url and self.is_valid_url(corrected_url):
+            self.load_url(corrected_url)
+            return
+        search_url = f"https://duckduckgo.com/?q={requests.utils.quote(query)}"
+        self.load_url(search_url)
+        
+    def attempt_url_correction(self, url):
+        """Attempt to correct common URL typos."""
+        url = url.lower()
+        if not (url.startswith('http://') or url.startswith('https://')):
+            url = 'https://' + url
+        corrections = {
+            '.con': '.com',
+            '.comm': '.com',
+            '.cmo': '.com',
+            '.cim': '.com',
+            'www,': 'www.',
+            'ww.' : 'www.',
+            'wwww.' : 'www.'
+        }
+        for typo, fix in corrections.items():
+            if typo in url:
+                url = url.replace(typo, fix)
+        return url if '.' in url.split('//')[-1] else None
 
     def is_valid_url(self, url):
         try:
@@ -1090,24 +1196,49 @@ class ShadowBrowser(Gtk.Application):
 
     def update_bookmarks_menu(self, menu_box):
         """Update the bookmarks menu with current bookmarks."""
-        while menu_box.get_first_child():
-            menu_box.remove(menu_box.get_first_child())
+        children = menu_box.observe_children()
+        for i in range(children.get_n_items()):
+            child = children.get_item(i)
+            menu_box.remove(child)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_propagate_natural_height(True)
+        scrolled.set_max_content_height(400)
+        bookmarks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        bookmarks_box.set_margin_top(5)
+        bookmarks_box.set_margin_bottom(5)
+        bookmarks_box.set_margin_start(5)
+        bookmarks_box.set_margin_end(5)
+        scrolled.set_child(bookmarks_box)
+        self.safe_append(menu_box, scrolled)
         for bookmark in self.bookmarks:
-            if isinstance(bookmark, str) and bookmark.startswith(
-                ("http://", "https://")
-            ):
+            if isinstance(bookmark, str) and bookmark.startswith(("http://", "https://")):
                 row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-                bookmark_button = Gtk.Button(label=bookmark)
-                bookmark_button.connect(
-                    "clicked", lambda btn, url=bookmark: self.load_url(url)
-                )
+                row.set_margin_top(2)
+                row.set_margin_bottom(2)
+                display_text = bookmark
+                if len(display_text) > 40:
+                    display_text = display_text[:37] + "..."                    
+                bookmark_button = Gtk.Button(label=display_text, hexpand=True, halign=Gtk.Align.START)
+                bookmark_button.set_tooltip_text(bookmark)
+                bookmark_button.connect("clicked", 
+                    lambda btn, url=bookmark: (self.load_url(url), self._close_bookmark_popover())
+                )               
+                delete_button = Gtk.Button(icon_name="user-trash-symbolic")
+                delete_button.set_tooltip_text("Remove bookmark")
+                delete_button.add_css_class("flat")
+                delete_button.connect("clicked", 
+                    lambda btn, url=bookmark: (self.delete_bookmark(url), self._close_bookmark_popover())
+                )              
                 self.safe_append(row, bookmark_button)
-                delete_button = Gtk.Button(label="❌")
-                delete_button.connect(
-                    "clicked", lambda btn, url=bookmark: self.delete_bookmark(url)
-                )
                 self.safe_append(row, delete_button)
-                self.safe_append(menu_box, row)
+                self.safe_append(bookmarks_box, row)
+        if self.bookmarks:
+            self.safe_append(bookmarks_box, Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+            clear_button = Gtk.Button(label="Clear All Bookmarks")
+            clear_button.add_css_class("destructive-action")
+            clear_button.connect("clicked", self._clear_all_bookmarks)
+            self.safe_append(bookmarks_box, clear_button)
 
     def delete_bookmark(self, bookmark):
         """Remove a bookmark."""
@@ -1132,8 +1263,7 @@ class ShadowBrowser(Gtk.Application):
                 with open(filename, "r") as f:
                     return json.load(f)
         except Exception:
-            pass
-        return []
+            return []
 
     def save_json(self, filename, data):
         """Save JSON data to file."""
@@ -1195,9 +1325,6 @@ class ShadowBrowser(Gtk.Application):
                 pass
         container.append(widget)
 
-    # Note: To avoid active state warnings for Gtk widgets, prefer connecting to "released" signal instead of "pressed"
-    # if you add any "pressed" signal handlers in the future.
-
     def add_new_tab(self, url):
         """Add a new tab with a webview loading the specified URL."""
         webview = self.create_secure_webview()
@@ -1233,6 +1360,10 @@ class ShadowBrowser(Gtk.Application):
         if 0 <= tab_index < len(self.tabs):
             tab = self.tabs[tab_index]
             webview = tab.webview
+            if webview is None:
+                self.tabs.pop(tab_index)
+                self.notebook.remove_page(tab_index)
+                return
             notebook_page_num = None
             for page_index in range(self.notebook.get_n_pages()):
                 page = self.notebook.get_nth_page(page_index)
@@ -1244,29 +1375,23 @@ class ShadowBrowser(Gtk.Application):
             if notebook_page_num is not None:
                 page = self.notebook.get_nth_page(notebook_page_num)
                 if page:
-                    # First get the webview from the page
                     if isinstance(page, Gtk.ScrolledWindow):
                         child = page.get_child()
                         if isinstance(child, Gtk.Viewport):
                             webview = child.get_child()
                         else:
                             webview = child
-                    # Remove the page first
                     self.notebook.remove_page(notebook_page_num)
-                    # Then unparent the webview
                     if webview:
                         try:
                             webview.unparent()
                         except Exception:
                             pass
-                    # Finally unparent the page itself
                     try:
                         page.unparent()
                     except Exception:
                         pass
-            # Remove tab from tabs list
             removed_tab = self.tabs.pop(tab_index)
-            # Disconnect signals from the webview to avoid potential memory leaks
             try:
                 if removed_tab.webview:
                     removed_tab.webview.disconnect_by_func(self.on_load_changed)
@@ -1310,7 +1435,6 @@ class ShadowBrowser(Gtk.Application):
         try:
             if window_features is None:
                 return None
-
             user_content_manager = webview.get_user_content_manager()
             new_webview = WebKit.WebView(user_content_manager=user_content_manager)
             settings = webview.get_settings()
@@ -1322,16 +1446,15 @@ class ShadowBrowser(Gtk.Application):
             if not hasattr(new_webview, "_decide_policy_connected"):
                 new_webview.connect("decide-policy", self.on_decide_policy)
                 new_webview._decide_policy_connected = True
-
             is_popup = False
             try:
                 if window_features is not None and hasattr(window_features, "get") and callable(window_features.get):
                     try:
                         is_popup = window_features.get("popup", False)
                     except Exception:
-                        pass
+                        is_popup = False
             except Exception:
-                pass
+                is_popup = False
             if is_popup:
                 self.open_popup_window(new_webview, window_features)
             else:
@@ -1339,32 +1462,24 @@ class ShadowBrowser(Gtk.Application):
             return new_webview
         except Exception:
             return None
-
-    # List of internal URLs to block by default
     BLOCKED_INTERNAL_URLS = ["about:blank", "about:srcdoc", "blob:", "data:", "about:debug"]
-
-    # Option to allow about:blank URLs if needed
-    allow_about_blank = False  # Changed to False to block about:blank URLs globally
+    allow_about_blank = False
 
     def is_internal_url_blocked(self, url, is_main_frame):
         """
         Determine if an internal URL should be blocked.
-
         Args:
             url (str): The URL to check.
             is_main_frame (bool): Whether the request is for the main frame.
-
         Returns:
             bool: True if the URL should be blocked, False otherwise.
         """
         if not url:
             return False
-        # Block if in blocked list and not allowed by flags
         if url.startswith("about:blank") and not self.allow_about_blank:
-            return True  # Block about:blank URLs when allow_about_blank is False
+            return True 
         if url in self.BLOCKED_INTERNAL_URLS:
             return True
-        # Block subframe navigation to internal schemes
         if not is_main_frame and url.startswith(("about:", "data:", "blob:")):
             return True
         return False
@@ -1379,13 +1494,10 @@ class ShadowBrowser(Gtk.Application):
             if not request:
                 decision.ignore()
                 return True
-
             requested_url = request.get_uri()
             if not requested_url:
                 decision.ignore()
                 return True
-
-            # Check if main frame
             is_main_frame = True
             if hasattr(navigation_action, "get_frame"):
                 frame = navigation_action.get_frame()
@@ -1393,28 +1505,20 @@ class ShadowBrowser(Gtk.Application):
                     try:
                         is_main_frame = frame.is_main_frame()
                     except Exception:
-                        pass  # fallback to True
-
-            # Use new method to check if internal URL should be blocked
+                        pass
             if self.is_internal_url_blocked(requested_url, is_main_frame):
                 decision.ignore()
                 return True
-
-            # Allow internal schemes for main frame only
             if requested_url.startswith(("about:", "data:", "blob:", "_data:")):
                 if not is_main_frame:
                     decision.ignore()
                     return True
                 decision.use()
                 return True
-
-            # Only allow http and https
             parsed = urlparse(requested_url)
             if parsed.scheme not in ("http", "https"):
                 decision.ignore()
                 return True
-
-            # Block cross-site subframe
             if not is_main_frame:
                 top_level_url = webview.get_uri()
                 if top_level_url:
@@ -1423,18 +1527,13 @@ class ShadowBrowser(Gtk.Application):
                     if top_host and req_host and top_host != req_host:
                         decision.ignore()
                         return True
-
-            # Apply adblocker logic
             if self.adblocker.is_blocked(requested_url):
                 decision.ignore()
                 return True
-
-            # Trigger manual download if file extension matches
             if requested_url.lower().endswith(tuple(DOWNLOAD_EXTENSIONS)):
                 self.start_manual_download(requested_url)
                 decision.ignore()
                 return True
-
             decision.use()
             return True
         except Exception:
@@ -1456,39 +1555,30 @@ class ShadowBrowser(Gtk.Application):
             if url is None:
                 decision.ignore()
                 return True
-
-            # Block about:blank URLs explicitly to prevent popups
             if url.lower() == "about:blank":
                 decision.ignore()
                 return True
-
             if url.lower() == "javascript:void(0)":
                 decision.ignore()
                 return True
-
             if url.lower().endswith(tuple(DOWNLOAD_EXTENSIONS)):
                 self.start_manual_download(url)
                 decision.ignore()
                 return True
-
             user_content_manager = webview.get_user_content_manager()
             new_webview = WebKit.WebView(user_content_manager=user_content_manager)
             self.setup_webview_settings(new_webview)
             self.download_manager.add_webview(new_webview)
-
             if not hasattr(new_webview, "_create_signal_connected"):
                 new_webview.connect("create", self.on_webview_create)
                 new_webview._create_signal_connected = True
-
             if not hasattr(new_webview, "_decide_policy_connected"):
                 new_webview.connect("decide-policy", self.on_decide_policy)
                 new_webview._decide_policy_connected = True
-
             self.add_webview_to_tab(new_webview)
             new_webview.load_uri(url)
             decision.ignore()
             return True
-
         except Exception:
             decision.ignore()
             return True
@@ -1497,20 +1587,16 @@ class ShadowBrowser(Gtk.Application):
         """Handle navigation and new window actions, manage downloads, enforce policies, and apply adblock rules."""
         try:
             from gi.repository import WebKit
-
             if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
                 return self._handle_navigation_action(webview, decision, decision.get_navigation_action())
             elif decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
                 return self._handle_new_window_action(webview, decision)
             else:
-                # Allow other decision types (e.g., RESPONSE, etc.)
                 decision.use()
                 return True
-
         except Exception:
             decision.ignore()
             return True
-
 
     def add_download_spinner(self, toolbar):
         """Add download spinner to toolbar."""
@@ -1524,8 +1610,71 @@ class ShadowBrowser(Gtk.Application):
 
     def start_manual_download(self, url):
         """Manually download a file from the given URL."""
-        import requests
-        from urllib.parse import urlparse
+        def sanitize_filename(filename):
+            """Sanitize and clean up the filename."""
+            filename = re.sub(r'[?#].*$', '', filename)
+            filename = re.sub(r'[?&][^/]+$', '', filename)
+            filename = re.sub(r'[^\w\-_. ]', '_', filename).strip()
+            return filename or 'download'
+
+        def get_filename_from_url(parsed_url):
+            """Extract and clean filename from URL path."""
+            path = unquote(parsed_url.path)
+            filename = os.path.basename(path)
+            if not filename and parsed_url.path.endswith('/'):
+                filename = parsed_url.netloc.split('.')[-2] if '.' in parsed_url.netloc else 'file'
+            if 'download' in parse_qs(parsed_url.query):
+                dl_param = parse_qs(parsed_url.query)['download'][0]
+                if dl_param:
+                    filename = unquote(dl_param)
+            return sanitize_filename(filename)
+
+        def get_extension_from_content_type(content_type):
+            """Get appropriate file extension from content type."""
+            content_type = (content_type or '').split(';')[0].lower()
+            ext_map = {
+                'video/mp4': '.mp4',
+                'video/webm': '.webm',
+                'video/quicktime': '.mov',
+                'video/x-msvideo': '.avi',
+                'video/x-matroska': '.mkv',
+                'video/3gpp': '.3gp',
+                'video/mpeg': '.mpeg',
+                'video/ogg': '.ogv',
+                'video/x-flv': '.flv',
+                'application/x-mpegURL': '.m3u8',
+                'application/dash+xml': '.mpd',
+                'application/octet-stream': '.bin',
+                'application/zip': '.zip',
+                'application/x-rar-compressed': '.rar',
+                'application/x-7z-compressed': '.7z',
+                'application/x-tar': '.tar',
+                'application/gzip': '.gz',
+                'application/x-bzip2': '.bz2',
+                'application/pdf': '.pdf',
+                'application/msword': '.doc',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+                'application/vnd.ms-excel': '.xls',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+                'application/vnd.ms-powerpoint': '.ppt',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+                'text/plain': '.txt',
+                'text/html': '.html',
+                'text/css': '.css',
+                'text/csv': '.csv',
+                'application/json': '.json',
+                'application/javascript': '.js',
+                'image/jpeg': '.jpg',
+                'image/png': '.png',
+                'image/gif': '.gif',
+                'image/webp': '.webp',
+                'image/svg+xml': '.svg',
+                'audio/mpeg': '.mp3',
+                'audio/wav': '.wav',
+                'audio/ogg': '.ogg',
+                'audio/webm': '.weba',
+            }
+            return ext_map.get(content_type, '')
 
         def download_thread():
             try:
@@ -1533,85 +1682,103 @@ class ShadowBrowser(Gtk.Application):
                 if not parsed_url.scheme or not parsed_url.netloc:
                     GLib.idle_add(
                         lambda: self.show_error_message("Invalid URL format"),
-                        priority=GLib.PRIORITY_DEFAULT
+                        priority=GLib.PRIORITY_DEFAULT,
                     )
                     return
-                with requests.get(url, stream=True, timeout=30) as response:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                with requests.get(url, stream=True, timeout=30, headers=headers) as response:
                     response.raise_for_status()
+                    content_disposition = response.headers.get("content-disposition", "")
                     filename = None
-                    content_disposition = response.headers.get('content-disposition')
                     if content_disposition:
-                        filename_match = re.search(r'filename="?([^"\\s]+)"?', content_disposition)
+                        filename_match = re.search(
+                            r'filename[^;=]*=([^;\n]*)', 
+                            content_disposition, 
+                            flags=re.IGNORECASE
+                        )
                         if filename_match:
-                            filename = filename_match.group(1)
+                            filename = filename_match.group(1).strip('\'" ')
+                            filename = unquote(filename)
+                            filename = sanitize_filename(filename)
                     if not filename:
-                        filename = os.path.basename(parsed_url.path)
-                    if not filename:
-                        filename = "download"
+                        filename = get_filename_from_url(parsed_url)
+                    base_name, ext = os.path.splitext(filename)
+                    if not ext:
+                        content_type = response.headers.get('content-type', '')
+                        ext = get_extension_from_content_type(content_type)
+                        if ext:
+                            filename = f"{base_name}{ext}"
                     downloads_dir = GLib.get_user_special_dir(
                         GLib.UserDirectory.DIRECTORY_DOWNLOAD
                     ) or os.path.expanduser("~/Downloads")
                     os.makedirs(downloads_dir, exist_ok=True)
-                    counter = 1
                     base_name, ext = os.path.splitext(filename)
+                    counter = 1
                     while os.path.exists(os.path.join(downloads_dir, filename)):
                         filename = f"{base_name}_{counter}{ext}"
                         counter += 1
                     filepath = os.path.join(downloads_dir, filename)
-                    total_size = int(response.headers.get('content-length', 0))
-                    block_size = 8192
+                    total_size = int(response.headers.get("content-length", 0))
                     downloaded = 0
                     progress_info = {
-                        'filename': filename,
-                        'total_size': total_size,
-                        'downloaded': downloaded,
-                        'cancelled': False
+                        "filename": filename,
+                        "total_size": total_size,
+                        "downloaded": downloaded,
+                        "cancelled": False,
+                        "thread_id": threading.current_thread().ident,
                     }
                     self.download_manager.add_progress_bar(progress_info)
-                    
                     try:
                         with open(filepath, 'wb') as f:
-                            for chunk in response.iter_content(block_size):
-                                if progress_info['cancelled']:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if progress_info["cancelled"]:
                                     break
                                 if chunk:
                                     f.write(chunk)
                                     downloaded += len(chunk)
-                                    progress = downloaded / total_size if total_size > 0 else 0
+                                    progress = (
+                                        downloaded / total_size if total_size > 0 else 0
+                                    )
                                     GLib.idle_add(
                                         self.download_manager.update_progress,
                                         progress_info,
-                                        progress
+                                        progress,
                                     )
-                        if not progress_info['cancelled']:
-                            GLib.idle_add(
-                                self.download_manager.download_finished,
-                                progress_info
-                            )
+                            if not progress_info["cancelled"]:
+                                GLib.idle_add(
+                                    self.download_manager.download_finished,
+                                    progress_info
+                                )
                     except Exception:
                         GLib.idle_add(
                             self.download_manager.download_failed,
                             progress_info,
-                            "Error writing to file"
+                            "Error writing to file",
                         )
                     finally:
                         GLib.idle_add(
                             self.download_manager.cleanup_download,
-                            progress_info['filename']
+                            progress_info["filename"],
                         )
             except requests.exceptions.RequestException:
                 GLib.idle_add(
                     self.download_manager.download_failed,
                     None,
-                    "Download request failed"
+                    "Download request failed",
                 )
             except Exception:
                 GLib.idle_add(
                     self.download_manager.download_failed,
                     None,
-                    "Unexpected download error"
+                    "Unexpected download error",
                 )
-        threading.Thread(target=download_thread, daemon=True, name=f"download_{url}").start()
+        thread = threading.Thread(
+            target=download_thread, daemon=True, name=f"download_{url}"
+        )
+        thread.start()
+        return thread.ident
 
     def on_forward_clicked(self, button):
         """Navigate forward in the current tab."""
@@ -1723,7 +1890,6 @@ class ShadowBrowser(Gtk.Application):
             try:
                 if result is None:
                     return
-                # Removed unused variable 'value'
                 webview.evaluate_javascript_finish(result)
             except Exception:
                 pass
@@ -1838,19 +2004,7 @@ class ShadowBrowser(Gtk.Application):
         )
         self.content_manager.add_style_sheet(style)
 
-    def inject_adware_cleaner(self):
-        try:
-            with open("adware_cleaner.js", "r") as f:
-                script_source = f.read()
-            script = WebKit.UserScript.new(
-                script_source,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit.UserScriptInjectionTime.END,
-            )
-            self.content_manager.add_script(script)
-        except Exception:
-            pass
-
+        
     def inject_remove_malicious_links(self):
         try:
             with open("remove_malicious_links.js", "r") as f:
@@ -1863,7 +2017,7 @@ class ShadowBrowser(Gtk.Application):
             self.content_manager.add_script(script)
         except Exception:
             pass
-
+        
     def inject_nonce_respecting_script(self):
         try:
             with open("bootstrap_nonce_script.js", "r") as f:
@@ -1872,13 +2026,19 @@ class ShadowBrowser(Gtk.Application):
                 script_source,
                 WebKit.UserContentInjectedFrames.ALL_FRAMES,
                 WebKit.UserScriptInjectionTime.END,
-                [],  # allow on all origins
+                [],
                 []
             )
             self.content_manager.add_script(user_script)
         except Exception:
             pass
 
-if __name__ == "__main__":
+def main():
+    """Main entry point for the application."""
     app = ShadowBrowser()
-    app.run(None)
+    return app.run(None)
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
+
