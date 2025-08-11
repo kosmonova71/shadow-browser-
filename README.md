@@ -73,3 +73,6 @@ This project is licensed under the MIT License.
 
 Andrew Power
 https://github.com/shadowyfigure/shadow-browser
+
+Works fine on most sites a few minor issues.
+On my dt do's list.
