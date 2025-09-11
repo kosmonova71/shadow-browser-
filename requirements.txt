@@ -1,0 +1,25 @@
+# Core Dependencies
+PyGObject>=3.42.0
+cryptography>=3.4.7
+requests>=2.26.0
+stem>=1.8.0  # For Tor support
+psutil>=5.9.0  # For process management in TorManager
+dbus-python
+
+# Optional: JavaScript obfuscation modules (custom/local modules)
+# These are optional and the application will work without them
+# js_obfuscation_improved
+# js_obfuscation
+
+# System Dependencies (install via package manager):
+# For GStreamer support (optional, enhances media playback):
+# Ubuntu/Debian: sudo apt-get install gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+# Fedora: sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good
+# Arch: sudo pacman -S gst-plugins-base gst-plugins-good
+
+# Development
+pytest>=6.2.5
+pytest-cov>=2.12.1
+black>=21.12b0
+flake8>=4.0.1
+mypy>=0.930
