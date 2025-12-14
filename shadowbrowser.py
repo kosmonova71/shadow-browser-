@@ -1,61 +1,44 @@
+import base64
 import datetime
+import hashlib
 import json
-import logging
 import os
-import platform
+import random
 import re
 import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
+import urllib.parse
 from urllib.parse import urlparse, urlunparse
-import random
 import gi
+import psutil
 import requests
-
-try:
-    import dbus
-    from dbus.mainloop.glib import DBusGMainLoop
-except ImportError:
-    dbus = None
-    DBusGMainLoop = None
-
+import uuid
+import gc
+from urllib.parse import unquote, quote
+from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
 from stem.control import Controller
+from urllib3.util.retry import Retry
 
 try:
     gi.require_version("Gtk", "4.0")
     gi.require_version("WebKit", "6.0")
     gi.require_version("Adw", "1")
-    gi.require_version("GdkPixbuf", "2.0")
     gi.require_version("Gdk", "4.0")
     gi.require_version('Gst', '1.0')
-    from gi.repository import Gtk, GLib, WebKit, GdkPixbuf, Gdk, Gst
+    from gi.repository import Gtk, GLib, WebKit, Gdk, Gst, Soup, GdkPixbuf, Gio, GObject
 except (ValueError, ImportError):
     exit(1)
 
-try:
-    Gst.init(None)
-    GST_AVAILABLE = True
-except Exception as e:
-    print(f"Warning: GStreamer initialization failed: {e}")
-    GST_AVAILABLE = False
-
 def safe_widget_append(container, widget):
-    """
-    Safely append a widget to a container, handling any necessary unparenting.    
-    Args:
-        container: The GTK container to append to.
-        widget: The widget to append.       
-    Returns:
-        bool: True if append was successful, False otherwise.
-    """
     if not container or not widget:
         return False
     try:
@@ -86,23 +69,17 @@ BOOKMARKS_FILE = "bookmarks.json"
 HISTORY_FILE = "history.json"
 SESSION_FILE = "session.json"
 TABS_FILE = "tabs.json"
+SETTINGS_FILE = os.path.expanduser("~/.config/shadowbrowser/settings.json")
 HISTORY_LIMIT = 100
+GST_AVAILABLE = True
 
 try:
     from js_obfuscation_improved import extract_url_from_javascript as js_extract_url
     from js_obfuscation_improved import extract_onclick_url
-    print("Imported extract_onclick_url from js_obfuscation_improved")
-except ImportError as e:
-    print("ImportError for js_obfuscation_improved:", e)
-    try:
-        from js_obfuscation import extract_url_from_javascript as js_extract_url
-        extract_onclick_url = None
-        print("Imported from js_obfuscation")
-    except ImportError as e2:
-        print("ImportError for js_obfuscation:", e2)
-        js_extract_url = None
-        extract_onclick_url = None
-        print("No obfuscation modules available")
+    extract_onclick_url = extract_onclick_url
+except ImportError:
+    js_extract_url = None
+    extract_onclick_url = None
 
 class SSLUtils:
     def __init__(self):
@@ -112,38 +89,22 @@ class SSLUtils:
         parsed = urlparse(url)
         host = parsed.hostname
         port = parsed.port or 443
-        try:
-            with socket.create_connection((host, port), timeout=5) as sock:
-                with self.context.wrap_socket(sock, server_hostname=host) as ssock:
-                    cert_bin = ssock.getpeercert(binary_form=True)
-                    cert = x509.load_der_x509_certificate(cert_bin, default_backend())
-                    return cert
-        except Exception:
-            return None
+        with socket.create_connection((host, port), timeout=5) as sock:
+            with self.context.wrap_socket(sock, server_hostname=host) as ssock:
+                cert_bin = ssock.getpeercert(binary_form=True)
+                cert = x509.load_der_x509_certificate(cert_bin, default_backend())
+                return cert
 
     def get_ocsp_url(self, cert):
-        try:
-            aia = cert.extensions.get_extension_for_oid(
-                x509.ExtensionOID.AUTHORITY_INFORMATION_ACCESS
-            ).value
-            for access in aia:
-                if access.access_method == x509.AuthorityInformationAccessOID.OCSP:
-                    return access.access_location.value
-        except Exception:
-            return None
+        aia = cert.extensions.get_extension_for_oid(
+            x509.ExtensionOID.AUTHORITY_INFORMATION_ACCESS
+        ).value
+        for access in aia:
+            if access.access_method == x509.AuthorityInformationAccessOID.OCSP:
+                return access.access_location.value
 
     def is_certificate_expired(self, cert: x509.Certificate) -> bool:
-        """
-        Check if the certificate is expired.
-        Args:
-            cert (x509.Certificate): The X.509 certificate object.
-        Returns:
-            bool: True if the certificate is expired, False otherwise.
-        """
-        try:
-            return cert.not_valid_after < datetime.datetime.utcnow()
-        except Exception:
-            return True
+        return cert.not_valid_after < datetime.datetime.now(datetime.timezone.utc)
 
 class DownloadManager:
     def __init__(self, parent_window):
@@ -156,105 +117,79 @@ class DownloadManager:
         self.on_download_finish_callback = None
 
     def safe_append(self, container, widget):
-        """
-        Safely append a widget to a container using the shared utility function.      
-        Args:
-            container: The GTK container to append to
-            widget: The widget to append            
-        Returns:
-            bool: True if append was successful, False otherwise
-        """
         return safe_widget_append(container, widget)
 
     def add_webview(self, webview):
-        """Connect download signals to the download manager."""
-        try:
-            webview.get_context().connect("download-started", self.on_download_started)
-        except Exception:
-            pass
+        webview.connect("download-started", self.on_download_started)
 
     def on_download_started(self, context, download):
-        """Handle download started event."""
-        try:
-            if self.on_download_start_callback:
-                self.on_download_start_callback()
-            uri = download.get_request().get_uri()
-            if not uri:
-                return False
-            downloads_dir = GLib.get_user_special_dir(
-                GLib.UserDirectory.DIRECTORY_DOWNLOAD
-            ) or os.path.expanduser("~/Downloads")
-            os.makedirs(downloads_dir, exist_ok=True)
-            filename = os.path.basename(uri)
-            counter = 1
-            base_name, ext = os.path.splitext(filename)
-            while os.path.exists(os.path.join(downloads_dir, filename)):
-                filename = f"{base_name}_{counter}{ext}"
-                counter += 1
-            filepath = os.path.join(downloads_dir, filename)
-            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            label = Gtk.Label(label=f"Downloading {filename}")
-            progress = Gtk.ProgressBar()
-            with self.lock:
-                self.downloads[download] = {
-                    "hbox": hbox,
-                    "label": label,
-                    "progress": progress,
-                    "filepath": filepath,
-                    "status": "Downloading",
-                    "cancelled": False,
-                }
-            self.safe_append(hbox, label)
-            self.safe_append(hbox, progress)
-            self.safe_append(self.box, hbox)
-            download.connect("notify::estimated-progress", self.on_progress_changed)
-            download.connect("notify::status", self.on_download_status_changed)
-            return True
-        except Exception as e:
-            self.show_error_message(f"Download failed: {str(e)}")
+        if self.on_download_start_callback:
+            self.on_download_start_callback()
+        uri = download.get_request().get_uri()
+        if not uri:
             return False
+        downloads_dir = GLib.get_user_special_dir(
+            GLib.UserDirectory.DIRECTORY_DOWNLOAD
+        ) or os.path.expanduser("~/Downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+        filename = os.path.basename(uri)
+        counter = 1
+        base_name, ext = os.path.splitext(filename)
+        while os.path.exists(os.path.join(downloads_dir, filename)):
+            filename = f"{base_name}_{counter}{ext}"
+            counter += 1
+        filepath = os.path.join(downloads_dir, filename)
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        label = Gtk.Label(label=f"Downloading {filename}")
+        progress = Gtk.ProgressBar()
+        with self.lock:
+            self.downloads[download] = {
+                "hbox": hbox,
+                "label": label,
+                "progress": progress,
+                "filepath": filepath,
+                "status": "Downloading",
+                "cancelled": False,
+            }
+        self.safe_append(hbox, label)
+        self.safe_append(hbox, progress)
+        self.safe_append(self.box, hbox)
+        download.connect("notify::estimated-progress", self.on_progress_changed)
+        download.connect("notify::status", self.on_download_status_changed)
+        return True
 
     def on_progress_changed(self, download, param):
-        """Update progress bar for a download."""
-        try:
-            with self.lock:
-                info = self.downloads.get(download)
-                if info:
-                    progress = download.get_estimated_progress()
-                    info["progress"].set_fraction(progress)
-                    info["progress"].set_text(f"{progress * 100:.1f}%")
-                    info["label"].set_text(f"Downloading {os.path.basename(info['filepath'])}")
-        except Exception:
-            pass
+        with self.lock:
+            info = self.downloads.get(download)
+            if info:
+                progress = download.get_estimated_progress()
+                info["progress"].set_fraction(progress)
+                info["progress"].set_text(f"{progress * 100:.1f}%")
+                info["label"].set_text(f"Downloading {os.path.basename(info['filepath'])}")
 
     def on_download_status_changed(self, download, param):
-        """Handle download status changes."""
-        try:
-            with self.lock:
-                info = self.downloads.get(download)
-                if info:
-                    status = download.get_status()
-                    if status == WebKit.DownloadStatus.FINISHED:
-                        info["status"] = "Finished"
-                        info["progress"].set_fraction(1.0)
-                        info["progress"].set_text("100%")
-                        info["label"].set_text(f"Download finished: {os.path.basename(info['filepath'])}")
-                        GLib.timeout_add_seconds(5, lambda: self.cleanup_download(download))
-                    elif status == WebKit.DownloadStatus.FAILED:
-                        info["status"] = "Failed"
-                        info["label"].set_text(f"Download failed: {os.path.basename(info['filepath'])}")
-                        info["progress"].set_text("Failed")
-                        GLib.timeout_add_seconds(5, lambda: self.cleanup_download(download))
-                    elif status == WebKit.DownloadStatus.CANCELLED:
-                        info["status"] = "Cancelled"
-                        info["label"].set_text(f"Download cancelled: {os.path.basename(info['filepath'])}")
-                        info["progress"].set_text("Cancelled")
-                        GLib.timeout_add_seconds(5, lambda: self.cleanup_download(download))
-        except Exception:
-            pass
+        with self.lock:
+            info = self.downloads.get(download)
+            if info:
+                status = download.get_status()
+                if status == WebKit.DownloadStatus.FINISHED:
+                    info["status"] = "Finished"
+                    info["progress"].set_fraction(1.0)
+                    info["progress"].set_text("100%")
+                    info["label"].set_text(f"Download finished: {os.path.basename(info['filepath'])}")
+                    GLib.timeout_add_seconds(5, lambda: self.cleanup_download(download))
+                elif status == WebKit.DownloadStatus.FAILED:
+                    info["status"] = "Failed"
+                    info["label"].set_text(f"Download failed: {os.path.basename(info['filepath'])}")
+                    info["progress"].set_text("Failed")
+                    GLib.timeout_add_seconds(5, lambda: self.cleanup_download(download))
+                elif status == WebKit.DownloadStatus.CANCELLED:
+                    info["status"] = "Cancelled"
+                    info["label"].set_text(f"Download cancelled: {os.path.basename(info['filepath'])}")
+                    info["progress"].set_text("Cancelled")
+                    GLib.timeout_add_seconds(5, lambda: self.cleanup_download(download))
 
     def add_progress_bar(self, progress_info):
-        """Add progress bar for manual downloads."""
         with self.lock:
             if self.on_download_start_callback:
                 self.on_download_start_callback()
@@ -278,7 +213,6 @@ class DownloadManager:
             self.safe_append(self.box, hbox)
 
     def update_progress(self, progress_info, progress):
-        """Update progress for manual downloads."""
         with self.lock:
             info = self.downloads.get(progress_info["filename"])
             if info:
@@ -287,7 +221,6 @@ class DownloadManager:
                 info["label"].set_text(f"Downloading {progress_info['filename']}")
 
     def download_finished(self, progress_info):
-        """Handle manual download finished."""
         with self.lock:
             if self.on_download_finish_callback:
                 self.on_download_finish_callback()
@@ -302,7 +235,6 @@ class DownloadManager:
                 )
 
     def download_failed(self, progress_info, error_message):
-        """Handle manual download failure."""
         with self.lock:
             if self.on_download_finish_callback:
                 self.on_download_finish_callback()
@@ -318,7 +250,6 @@ class DownloadManager:
                 )
 
     def cleanup_download(self, download_key):
-        """Clean up download UI elements."""
         with self.lock:
             info = self.downloads.pop(download_key, None)
             if info:
@@ -331,7 +262,6 @@ class DownloadManager:
                     pass
 
     def ensure_download_directory(self):
-        """Ensure the downloads directory exists."""
         downloads_dir = GLib.get_user_special_dir(
             GLib.UserDirectory.DIRECTORY_DOWNLOAD
         ) or os.path.expanduser("~/Downloads")
@@ -341,43 +271,38 @@ class DownloadManager:
             raise
 
     def show(self):
-        """Show the downloads area."""
-        try:
-            if hasattr(self, "download_area") and self.download_area:
-                if self.download_area.get_parent() is not None:
-                    return           
-            self.download_area = Gtk.ScrolledWindow()
-            self.download_area.set_policy(
-                Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
-            )
-            self.download_area.set_max_content_height(200)
-            self.download_area.set_min_content_height(0)
-            self.download_area.set_child(self.box)
-            self.download_area.set_vexpand(False)
-            self.download_area.set_margin_top(5)
-            self.download_area.set_margin_bottom(5)
-            parent_window = self.parent_window
-            if parent_window is None:
-                return                
-            parent_child = parent_window.get_child()
-            if parent_child is not None and hasattr(parent_child, "append"):
-                if hasattr(self.download_area, 'get_parent') and self.download_area.get_parent() is not None:
-                    parent = self.download_area.get_parent()
-                    if parent and hasattr(parent, "remove"):
-                        try:
-                            if self.download_area.get_parent() == parent:
-                                parent.remove(self.download_area)
-                        except Exception:
-                            pass  
-                try:
-                    parent_child.append(self.download_area)
-                except Exception:
-                    pass  
-        except Exception:
-            pass
+        if hasattr(self, "download_area") and self.download_area:
+            if self.download_area.get_parent() is not None:
+                return
+        self.download_area = Gtk.ScrolledWindow()
+        self.download_area.set_policy(
+            Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC
+        )
+        self.download_area.set_max_content_height(200)
+        self.download_area.set_min_content_height(0)
+        self.download_area.set_child(self.box)
+        self.download_area.set_vexpand(False)
+        self.download_area.set_margin_top(5)
+        self.download_area.set_margin_bottom(5)
+        parent_window = self.parent_window
+        if parent_window is None:
+            return
+        parent_child = parent_window.get_child()
+        if parent_child is not None and hasattr(parent_child, "append"):
+            if hasattr(self.download_area, 'get_parent') and self.download_area.get_parent() is not None:
+                parent = self.download_area.get_parent()
+                if parent and hasattr(parent, "remove"):
+                    try:
+                        if self.download_area.get_parent() == parent:
+                            parent.remove(self.download_area)
+                    except Exception:
+                        pass
+            try:
+                parent_child.append(self.download_area)
+            except Exception:
+                pass
 
     def clear_all(self):
-        """Clear all completed downloads from the UI."""
         for download, info in list(self.downloads.items()):
             if info["status"] in ["Finished", "Failed", "Cancelled"]:
                 self.cleanup_download(download)
@@ -394,11 +319,176 @@ class AdBlocker:
 
     def inject_to_webview(self, user_content_manager):
         self.inject_adblock_script_to_ucm(user_content_manager)
+        self.inject_webkitgtk_compatibility_script(user_content_manager)
+
+    def inject_webkitgtk_compatibility_script(self, user_content_manager):
+        webkitgtk_compatibility_script = r"""
+    (function () {
+        // Prevent double injection
+        if (window.__webkitgtkCompatInjected) return;
+        window.__webkitgtkCompatInjected = true;
+        // Toggle verbose logging (set to true for debugging)
+        const DEBUG = false;
+        const log = (...args) => DEBUG && console.log('[WebKitGTK]', ...args);
+        log('Initializing compatibility layer...');
+        let attempts = 0;
+        const MAX_ATTEMPTS = 3;
+        function pageLooksComplete() {
+            const body = document.body;
+            if (!body) return false;
+            return (
+                body.innerHTML.trim().length > 100 ||
+                document.querySelector('img, iframe, frame')
+            );
+        }
+        function reExecuteExternalScripts() {
+            const scripts = document.querySelectorAll('script[src]:not([data-executed])');
+            scripts.forEach(script => {
+                try {
+                    const clone = document.createElement('script');
+                    clone.src = script.src;
+                    clone.onload  = () => log('Reloaded script:', script.src);
+                    clone.onerror = () => log('Failed to reload script:', script.src);
+                    script.setAttribute('data-executed', 'true');
+                    document.head.appendChild(clone);
+                } catch (e) {
+                    log('reExecuteExternalScripts exception', e);
+                }
+            });
+        }
+        function ensurePageLoads() {
+            attempts++;
+            log(`Page load attempt ${attempts}`);
+            if (!pageLooksComplete() && attempts < MAX_ATTEMPTS) {
+                log('Page appears incomplete — retrying...');
+                reExecuteExternalScripts();
+                return setTimeout(ensurePageLoads, 1000);
+            }
+            applyCompatibilityFixes();
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', ensurePageLoads);
+        } else {
+            setTimeout(ensurePageLoads, 200);
+        }
+        function safeRecovery() {
+            ['initializePage', 'setupPlayer'].forEach(fn => {
+                if (typeof window[fn] === 'function') {
+                    try { window[fn](); }
+                    catch (e) { log(`Recovery ${fn}() failed:`, e); }
+                }
+            });
+        }
+        window.addEventListener('error', event => {
+            try {
+                log('Caught error:', event && event.message);
+                if (/Unexpected (EOF|end)/i.test(String(event && event.message))) {
+                    log('Attempting recovery from syntax error...');
+                    setTimeout(safeRecovery, 300);
+                }
+                const undef = (event && event.message && event.message.match(/(\w+) is not defined/));
+                if (undef) {
+                    const name = undef[1];
+                    log('Auto-defining missing variable:', name);
+                    // create a benign object placeholder instead of a primitive
+                    if (typeof window[name] === 'undefined') {
+                        window[name] = {};
+                    }
+                }
+            } catch (e) {
+                log('error handler failed:', e);
+            }
+        });
+        if (!window.webkit) {
+            log('Injecting window.webkit polyfill...');
+            window.webkit = {
+                messageHandlers: {
+                    setCookie: {
+                        postMessage(data) {
+                            try { document.cookie = String(data); log('Cookie set:', data); }
+                            catch(e) { log('setCookie failed', e); }
+                        }
+                    },
+                    localStorage: {
+                        postMessage(data) {
+                            try {
+                                log('localStorage op:', data);
+                                if (data && data.action === 'setItem' && window.localStorage) {
+                                    localStorage.setItem(String(data.key), String(data.value));
+                                }
+                            } catch (e) { log('localStorage.postMessage failed', e); }
+                        }
+                    }
+                }
+            };
+        }
+        if (!Array.prototype.forEach) {
+            Array.prototype.forEach = function (callback, thisArg) {
+                if (this == null) { throw new TypeError('Array.prototype.forEach called on null or undefined'); }
+                if (typeof callback !== 'function') { throw new TypeError(callback + ' is not a function'); }
+                const O = Object(this);
+                const len = O.length >>> 0;
+                for (let i = 0; i < len; i++) {
+                    if (i in O) callback.call(thisArg, O[i], i, O);
+                }
+            };
+        }
+        if (!window.dbneg) {
+            window.dbneg = function (id) {
+                log('dbneg called with:', id);
+                try {
+                    const selector = `[data-id="${id}"], [id*="${id}"], [onclick*="${id}"]`;
+                    const els = document.querySelectorAll(selector);
+                    for (const el of els) {
+                        const raw = el.getAttribute('onclick') || el.getAttribute('href') || '';
+                        const m = raw.match(/['"]([^'"]+)['"]/);
+                        if (m && m[1] && m[1] !== 'javascript:void(0)') {
+                            log('dbneg resolved to URL:', m[1]);
+                            return m[1];
+                        }
+                    }
+                } catch (e) {
+                    log('dbneg failed:', e);
+                }
+                return 'about:blank';
+            };
+        }
+        window.agego_aver = window.agego_aver || 'true';
+        window.videoPlayer = window.videoPlayer || {
+            play:  () => log('videoPlayer.play()'),
+            pause: () => log('videoPlayer.pause()'),
+            load:  () => log('videoPlayer.load()'),
+            currentTime: 0,
+            duration: 0,
+            src: ''
+        };
+        function applyCompatibilityFixes() {
+            // keep this intentionally small; add site-specific fixes here if needed
+            log('Applying compatibility fixes (no-op placeholder)');
+        }
+        log('Compatibility layer fully initialized.');
+    })();
+    """
+        try:
+            user_content_manager.add_script(
+                WebKit.UserScript.new(
+                    webkitgtk_compatibility_script,
+                    WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                    WebKit.UserScriptInjectionTime.START,
+                )
+            )
+        except TypeError:
+            user_content_manager.add_script(
+                WebKit.UserScript.new(
+                    webkitgtk_compatibility_script,
+                    WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                    WebKit.UserScriptInjectionTime.START,
+                    None
+                )
+            )
+
 
     def inject_adblock_script_to_ucm(self, user_content_manager):
-        """
-        Injects JavaScript into UserContentManager to block ads and handle void links.
-        """
         adblock_script = r"""
         (function() {
             const selectorsToHide = [
@@ -451,7 +541,8 @@ class AdBlocker:
                 const originalOpen = xhr.open;
                 xhr.open = function(method, url) {
                     if (isUrlBlocked(url)) {
-                        arguments[1] = 'about:blank#blocked';
+                        // Don't modify arguments - return early instead
+                        return;
                     }
                     return originalOpen.apply(this, arguments);
                 };
@@ -462,7 +553,7 @@ class AdBlocker:
                 window.fetch = function(input, init) {
                     const url = typeof input === 'string' ? input : (input && input.url);
                     if (isUrlBlocked(url)) {
-                        return Promise.reject(new Error('AdBlock: Fetch blocked'));
+                        return Promise.reject(new Error('AdBlock: Request blocked'));
                     }
                     return originalFetch.apply(this, arguments);
                 };
@@ -534,7 +625,6 @@ class AdBlocker:
         self.enabled = False
 
     def load_block_lists(self):
-        """Loads and caches ad blocking patterns from EasyList."""
         if (
             os.path.exists(self.cache_file)
             and (time.time() - os.path.getmtime(self.cache_file)) < self.cache_max_age
@@ -550,7 +640,6 @@ class AdBlocker:
         self.blocked_patterns = self._parse_block_patterns(lines)
 
     def fetch_block_list(self, url):
-        """Fetches the block list content from a URL."""
         try:
             response = requests.get(url, timeout=10)
             response.raise_for_status()
@@ -563,7 +652,6 @@ class AdBlocker:
             return []
 
     def _parse_block_patterns(self, lines):
-        """Parses block list rules into regex patterns."""
         compiled_patterns = []
         for line in lines:
             if any(s in line for s in ("##", "#@#", "@@")):
@@ -587,20 +675,16 @@ class AdBlocker:
         return compiled_patterns
 
     def is_blocked(self, url):
-        """Checks if the given URL matches any blocked pattern."""
         if not self.enabled or not url:
             return False
-        try:
-            parsed = urlparse(url)
-            full_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            for pattern in self.adult_patterns:
-                if pattern in full_url.lower():
-                    return True
-            for pattern in self.blocked_patterns:
-                if pattern.search(full_url):
-                    return True
-        except Exception:
-            pass
+        parsed = urlparse(url)
+        full_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        for pattern in self.adult_patterns:
+            if pattern in full_url.lower():
+                return True
+        for pattern in self.blocked_patterns:
+            if pattern.search(full_url):
+                return True
         return False
 
     def connect_webview_signals(self, webview):
@@ -629,16 +713,36 @@ class AdBlocker:
         return urlunparse(parsed_url)
 
     def enable_csp(self, webview, csp_policy=None):
-        """
-        Enable Content Security Policy on the webview with optional CSP string.
-        Sanitizes the CSP string to remove unsupported directives like 'manifest-src'.
-        """
         if csp_policy is None:
-            csp_policy = "default-src 'self'; script-src 'self' https://trusted.com;"
-        import re
+            csp_policy = """
+                default-src https: http: data: blob:;
+                script-src 'unsafe-inline' 'unsafe-eval' https: http: data: blob: *;
+                style-src 'unsafe-inline' https: http: data: *;
+                img-src data: https: http: blob: *;
+                media-src blob: https: http: data: *;
+                connect-src https: http: wss: ws: * theanimecommunity.com *.theanimecommunity.com justanime.vercel.app *.justanime.vercel.app animixplay.st *.animixplay.st;
+                frame-src https: http: *;
+                child-src blob: https: http: *;
+                worker-src blob: https: http: *;
+                font-src https: http: data: *;
+                object-src 'none';
+                base-uri 'self';
+                form-action https: http: *;
+                frame-ancestors 'self';
+                upgrade-insecure-requests;
+            """
         sanitized_csp = re.sub(
-            r"\bmanifest-src[^;]*;?", "", csp_policy, flags=re.IGNORECASE
+            r"\b(manifest-src|prefetch-src|navigate-to|require-trusted-types-for|sandbox|trusted-types)[^;]*;?",
+            "",
+            csp_policy,
+            flags=re.IGNORECASE
         ).strip()
+        if "media-src" not in sanitized_csp:
+            sanitized_csp += "; media-src 'self' blob: https: *;"
+        if "connect-src" not in sanitized_csp:
+            sanitized_csp += "; connect-src 'self' https: wss:;"
+        if "child-src" not in sanitized_csp:
+            sanitized_csp += "; child-src 'self' blob: https:;"
         if sanitized_csp.endswith(";"):
             sanitized_csp = sanitized_csp[:-1].strip()
         csp_script = f"""
@@ -651,10 +755,27 @@ class AdBlocker:
         """
         script = WebKit.UserScript.new(
             csp_script,
-            WebKit.UserContentInjectedFrames.TOP_FRAME,
+            WebKit.UserContentInjectedFrames.ALL_FRAMES,
             WebKit.UserScriptInjectionTime.START,
+            None,
+            None
         )
         webview.get_user_content_manager().add_script(script)
+        webview.get_settings().set_allow_modal_dialogs(True)
+        webview.get_settings().set_allow_file_access_from_file_urls(True)
+        webview.get_settings().set_allow_universal_access_from_file_urls(True)
+        settings = webview.get_settings()
+        settings.set_property('enable-media', True)
+        settings.set_property('enable-media-capabilities', True)
+        settings.set_property('enable-media-stream', True)
+        settings.set_property('enable-mediasource', True)
+        settings.set_property('enable-encrypted-media', True)
+        settings.set_property('media-playback-requires-user-gesture', False)
+        settings.set_property('auto-load-images', True)
+        settings.set_property('allow-modal-dialogs', True)
+        settings.set_property('allow-file-access-from-file-urls', True)
+        settings.set_property('allow-universal-access-from-file-urls', True)
+        webview.set_settings(settings)
 
     def report_csp_violation(self, report):
         report_url = "http://127.0.0.1:9000/"
@@ -664,10 +785,7 @@ class AdBlocker:
             data=data,
             headers={"Content-Type": "application/csp-report"}
         )
-        try:
-            with urllib.request.urlopen(req) as _:
-                pass
-        except Exception:
+        with urllib.request.urlopen(req) as _:
             pass
 
     def on_csp_violation(self, report):
@@ -675,11 +793,8 @@ class AdBlocker:
         self.report_csp_violation(report)
 
     def is_third_party_request(self, url, current_origin):
-        try:
-            page_origin = urlparse(self.get_current_webview().get_uri()).netloc
-            return current_origin != page_origin
-        except Exception:
-            return False
+        page_origin = urlparse(self.get_current_webview().get_uri()).netloc
+        return current_origin != page_origin
 
     def enable_mixed_content_blocking(self, webview):
         settings = webview.get_settings()
@@ -687,31 +802,12 @@ class AdBlocker:
         webview.set_settings(settings)
 
     def secure_cookies(self):
-        """Disable all cookies by setting accept policy to NEVER."""
-        try:
-            webview = self.get_current_webview()
-            if webview:
-                cookie_manager = webview.get_context().get_cookie_manager()
-                cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.NEVER)
-        except Exception:
-            pass
-
-    def set_samesite_cookie(self, cookie_manager, cookie):
-        cookie.set_same_site(WebKit.CookieSameSitePolicy.STRICT)
-        cookie_manager.set_cookie(cookie)
-
-    def attach_csp_listener(self, webview):
-        manager = webview.get_user_content_manager()
-        manager.connect("console-message-received", self.on_console_message)
-
-    def on_console_message(self, manager, message):
-        msg_text = message.get_text()
-        if "Refused to load" in msg_text or "CSP" in msg_text:
-            report = {"message": msg_text, "source": "console"}
-            self.on_csp_violation(report)
+        webview = self.get_current_webview()
+        if webview:
+            cookie_manager = webview.get_context().get_cookie_manager()
+            cookie_manager.set_accept_policy(WebKit.CookieAcceptPolicy.NEVER)
 
 class SocialTrackerBlocker:
-    """Minimal social tracker blocker providing a domain substring blocklist."""
     def __init__(self):
         self.blocklist = [
             "facebook.com",
@@ -730,464 +826,386 @@ class SocialTrackerBlocker:
         ]
 
     def handle_blob_uri(self, request, user_data=None):
-        """Handle blob: URIs for media streaming"""
         request.finish_error(WebKit.NetworkError.CANCELLED, "Blob URI media playback not supported")
 
     def handle_data_uri(self, request, user_data=None):
-        """Handle data: URIs for embedded content"""
         request.finish_error(WebKit.NetworkError.CANCELLED, "Data URI handling not implemented")
 
     def handle_media_request(self, request, user_data=None):
-        """Handle media requests for better streaming support"""
         uri = request.get_uri()
         if any(substring in uri for substring in self.blocklist):
             request.finish_error(WebKit.NetworkError.CANCELLED, "Media request blocked")
             return
         request.finish()
-        
+
 class TorManager:
-    def __init__(self, tor_port=9050, control_port=9051):
-        """Initialize Tor manager to use system Tor instance.        
-        Args:
-            tor_port: Port for SOCKS proxy (default: 9050)
-            control_port: Port for Tor control (default: 9051)
-        """
-        self.tor_port = tor_port
+    def __init__(self, tor_port=None, control_port=9051):
+        self.tor_port = tor_port or self.detect_tor_port()
         self.control_port = control_port
         self.controller = None
         self.is_running_flag = False
         self.tor_data_dir = os.path.join(os.path.expanduser('~'), '.tor', 'shadow-browser')
         self.torrc_path = os.path.join(self.tor_data_dir, 'torrc')
-        self.tor_log_file = os.path.join(self.tor_data_dir, 'tor.log')
-        self.password = None 
+        self.password = None
         self.use_bridges = False
         self.proxy_settings = None
-        self.use_system_tor = False
+        self.use_system_tor = True
+        self.network_session = None
 
-    def _check_system_tor_running(self):
-        """Check if system Tor is already running on standard ports."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                if s.connect_ex(("127.0.0.1", self.tor_port)) == 0:
-                    return True
-            return False
-        except Exception as e:
-            print(f"Error checking system Tor status: {e}")
-            return False
+    @staticmethod
+    def detect_tor_port():
+        for port in (9050, 9150, 9051, 9151):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.5)
+                    if s.connect_ex(('127.0.0.1', port)) == 0:
+                        return port
+            except (socket.error, OSError):
+                continue
+        return None
 
     def _is_tor_already_running(self):
-        """Check if a Tor process is already running using the data directory or standard ports."""
-        import psutil
-        try:
-            for proc in psutil.process_iter(['name', 'cmdline', 'pid']):
-                try:
-                    if proc.info['name'] and 'tor' in proc.info['name'].lower():
-                        cmdline = proc.info['cmdline'] or []                        
-                        if any(self.tor_data_dir in arg for arg in cmdline):
-                            return True
-                        if any('9050' in arg or '9051' in arg for arg in cmdline):
-                            return True
-                        try:
-                            connections = proc.net_connections()
-                            for conn in connections:
-                                if hasattr(conn, 'laddr') and conn.laddr.port in [9050, 9051]:
-                                    return True
-                        except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
-                            continue                            
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue                   
-            try:
-                import socket
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(1)
-                    result = sock.connect_ex(('127.0.0.1', 9051))
-                    if result == 0:
-                        return True
-            except Exception:
-                pass               
-        except ImportError:
-            try:
-                import socket
-                for port in [9050, 9051]:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                        sock.settimeout(1)
-                        result = sock.connect_ex(('127.0.0.1', port))
-                        if result == 0:
-                            return True
-            except Exception:
-                pass           
-        return False
-
-    def _create_torrc(self):
-        """Create a torrc configuration file with enhanced security settings."""
-        try:
-            with open(self.torrc_path, 'w') as f:
-                f.write(f"SOCKSPort {self.tor_port if self.tor_port else 'auto'}\n")
-                f.write(f"ControlPort {self.control_port if self.control_port else 'auto'}\n")
-                f.write(f"DataDirectory {self.tor_data_dir}\n")
-                f.write(f"Log notice file {self.tor_log_file}\n")          
-                f.write("ClientOnly 1\n")
-                f.write("SafeLogging 1\n")
-                f.write("SafeSocks 1\n")
-                f.write("WarnUnsafeSocks 1\n")
-                f.write("StrictNodes 1\n")
-                f.write("EnforceDistinctSubnets 1\n")
-                f.write("NewCircuitPeriod 30\n")
-                f.write("MaxCircuitDirtiness 10 minutes\n")
-                f.write("MaxClientCircuitsPending 48\n")               
-                f.write("AvoidDiskWrites 1\n")
-                f.write("DisableDebuggerAttachment 0\n")
-                f.write("HardwareAccel 1\n")               
-                if self.password:
-                    f.write(f"HashedControlPassword {self._hash_password()}\n")
-                else:
-                    f.write("CookieAuthentication 1\n")
-                f.write("UseEntryGuards 1\n")
-                f.write("NumEntryGuards 3\n")
-                f.write("UseGuardFraction 1\n")
-                f.write("UseMicrodescriptors 1\n")
-                f.write("UseMicrodescriptors 1\n")                
-                f.write("ExitPolicy reject *:*\n")              
-                if self.use_bridges:
-                    f.write("UseBridges 1\n")
-                    f.write("Bridge obfs4 193.11.166.194:27015 1E2F3F6C31013377B838710AF02C77BEA4780F55 cert=FK8a9Aqghj9FwpbMp5Aog6UC5uvLQfk24UqBLidRsW0udof8OWaSpH6pdAKJreYwZVDpoGgA iat-mode=0\n")
-                    f.write("ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy\n")
-                if self.proxy_settings:
-                    proxy_type = self.proxy_settings.get('type', 'socks5')
-                    proxy_host = self.proxy_settings.get('host', '')
-                    proxy_port = self.proxy_settings.get('port', '')
-                    if proxy_host and proxy_port:
-                        f.write(f"{proxy_type.upper()}Proxy {proxy_host}:{proxy_port}\n")
-                        if 'username' in self.proxy_settings and 'password' in self.proxy_settings:
-                            f.write(f"{proxy_type.upper()}ProxyAuthenticator {self.proxy_settings['username']}:{self.proxy_settings['password']}\n")
+        detected_port = self.detect_tor_port()
+        if detected_port:
+            self.tor_port = detected_port
+            self.use_system_tor = True
+            self.is_running_flag = True
             return True
-        except Exception as e:
-            print(f"Error creating torrc: {e}")
-            return False
-    
-    def _hash_password(self):
-        """Hash the password for Tor control port authentication."""
-        if not self.password:
-            return ""
-        try:
-            import hashlib
-            salt = os.urandom(8)
-            key = hashlib.pbkdf2_hmac('sha1', self.password.encode(), salt, 1000, 32)
-            return '16:' + salt.hex() + key.hex()
-        except Exception as e:
-            print(f"Error hashing password: {e}")
-            return ""
-
-    def start(self):
-        """Start the Tor process with proper error handling and port fallback."""
-        try:
-            if not shutil.which("tor"):
-                print("Tor executable not found. Please install Tor.")
-                return False
-            if hasattr(self, 'process') and self.process:
-                self.process.terminate()
-                self.process = None
-            
-            if self._check_system_tor_running():
-                print("System Tor service is running")
-                self.use_system_tor = True
-                self.is_running_flag = True
-                return True                
-            if self._is_tor_already_running():
-                print("Found existing Tor process. Attempting to connect...")
-                for control_port in [9051, 9151, 9152, 9153]:
+        for port in (9050, 9150, 9051, 9151):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.5)
+                    if s.connect_ex(('127.0.0.1', port)) == 0:
+                        self.tor_port = port
+                        self.use_system_tor = True
+                        self.is_running_flag = True
+                        return True
+            except (socket.error, OSError):
+                continue
+        for proc in psutil.process_iter(['name', 'cmdline', 'pid']):
+            try:
+                if proc.info['name'] and 'tor' in proc.info['name'].lower():
+                    cmdline = proc.info['cmdline'] or []
+                    if any(self.tor_data_dir in arg for arg in cmdline):
+                        return True
+                    if any('9050' in arg or '9051' in arg for arg in cmdline):
+                        return True
                     try:
-                        controller = Controller.from_port(port=control_port)
-                        controller.authenticate()
-                        self.controller = controller                        
-                        socks_ports = controller.get_conf('SocksPort', multiple=True)
-                        if socks_ports:
-                            try:
-                                self.tor_port = int(socks_ports[0].split(':')[0])
-                                print(f"Found Tor SOCKS port: {self.tor_port}")
-                            except (ValueError, IndexError) as e:
-                                print(f"Warning: Could not parse SOCKS port: {e}")
-                                self.tor_port = 9050                        
-                        control_ports = controller.get_conf('ControlPort', multiple=True)
-                        if control_ports:
-                            try:
-                                self.control_port = int(control_ports[0])
-                                print(f"Found Tor control port: {self.control_port}")
-                            except (ValueError, IndexError) as e:
-                                print(f"Warning: Could not parse control port: {e}")
-                                self.control_port = control_port                       
-                        try:
-                            controller.get_info('version')
-                            self.is_running_flag = True
-                            print(f"Successfully connected to existing Tor instance: SOCKS={self.tor_port}, Control={self.control_port}")
-                            return True
-                        except Exception as e:
-                            print(f"Warning: Could not verify Tor control connection: {e}")
-                            continue                           
-                    except Exception as e:
-                        print(f"Failed to connect to Tor control port {control_port}: {str(e)}")
-                        continue               
-                if not self.is_running_flag:
-                    print("Warning: Could not connect to any running Tor instance, will try to start a new one")            
-            return self._start_new_tor_instance()            
-        except Exception as e:
-            print(f"Error in TorManager.start(): {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+                        for conn in proc.net_connections(kind='inet'):
+                            if conn.laddr.port in [9050, 9051]:
+                                return True
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
 
     def stop(self):
-        """Stop the Tor process and clean up resources."""
-        success = True
-        if hasattr(self, 'controller') and self.controller:
-            try:
-                if self.controller.is_alive():
-                    self.controller.close()
-            except Exception:
-                success = False
-            finally:
+        try:
+            if self.controller:
+                self.controller.close()
                 self.controller = None
-        if hasattr(self, 'process') and self.process:
-            try:
-                if self.process.poll() is None:
+            if hasattr(self, 'process') and self.process:
+                try:
                     self.process.terminate()
+                    self.process.wait(timeout=5)
+                except (subprocess.TimeoutExpired, ProcessLookupError):
                     try:
-                        self.process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            self.process.kill()
-                            self.process.wait()
-                        except Exception:
-                            success = False
-            except Exception:
-                success = False
-            finally:
-                self.process = None
-        self.is_running_flag = False
-        return success
+                        self.process.kill()
+                    except (ProcessLookupError, subprocess.SubprocessError):
+                        self.process = None
+            self.is_running_flag = False
+            self.tor_port = None
+            return True
+        except Exception:
+            return False
 
     def is_running(self):
-        """Check if Tor is running and connected."""
-        if self.use_system_tor:
-            return self._check_system_tor_running()
-        if self.controller:
+        if self.is_running_flag:
             try:
-                self.controller.get_info("version")
-                return True
-            except Exception as e:
-                print(f"Error checking Tor controller status: {e}")
-                return False
-        return self.is_running_flag
-
-    def new_identity(self):
-        """Request a new Tor circuit using system Tor."""
-        if not self.is_running():
-            if not self.start():
-                return False                
-        try:
-            if self.controller and self.controller.is_alive():
-                self.controller.signal("NEWNYM")
-                print("Requested new Tor circuit")
-                return True
-        except Exception as e:
-            print(f"Error requesting new Tor circuit: {e}")
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1)
+                    if s.connect_ex(('127.0.0.1', self.tor_port or 9050)) == 0:
+                        return True
+                self.is_running_flag = False
+            except Exception:
+                self.is_running_flag = False
+        if self._is_tor_already_running():
+            self.is_running_flag = True
+            return True
         return False
 
-    def setup_proxy(self, web_context):
-        """Configure web context to use Tor proxy."""
-        if not self.is_running():
-            if not self.start():
-                print("Failed to start Tor")
-                return False        
-        proxy_port = self.tor_port
-        print(f"Configuring SOCKS5 proxy on 127.0.0.1:{proxy_port}")        
-        proxy = WebKit.NetworkProxy()
-        proxy.set_protocol(WebKit.NetworkProxyProtocol.SOCKS5)
-        proxy.set_hostname("127.0.0.1")
-        proxy.set_port(proxy_port)
-        web_context.set_network_proxy_settings(
-            WebKit.NetworkProxyMode.CUSTOM,
-            { "http": proxy, "https": proxy, "ftp": proxy }
-        )
-        return True
+    def start(self):
+        if self.is_running():
+            return True
+        if not shutil.which("tor"):
+            return False
+        if hasattr(self, 'process') and self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    self.process.kill()
+                except (ProcessLookupError, subprocess.SubprocessError):
+                        self.process = None
+        if self._is_tor_already_running():
+            self.use_system_tor = True
+            self.is_running_flag = True
+            return True
+
+        if self._is_tor_already_running():
+            for control_port in [9051, 9151, 9152, 9153]:
+                controller = Controller.from_port(port=control_port)
+                controller.authenticate(password="shadow-browser")
+                self.controller = controller
+                socks_ports = controller.get_conf('SocksPort', multiple=True)
+                if socks_ports:
+                    try:
+                        self.tor_port = int(socks_ports[0].split(':')[0])
+                    except (ValueError, IndexError):
+                        self.tor_port = 9050
+                control_ports = controller.get_conf('ControlPort', multiple=True)
+                if control_ports:
+                    try:
+                        self.control_port = int(control_ports[0])
+                    except (ValueError, IndexError):
+                        self.control_port = control_port
+                    controller.get_info('version')
+                    self.is_running_flag = True
+                    return True
+            if not self.is_running_flag:
+                return self._start_new_tor_instance()
+        return False
+
+    def _get_network_session(self, webview):
+        if self.network_session is None and webview:
+            try:
+                if hasattr(webview, 'get_context'):
+                    webview.get_context()
+                    self.network_session = WebKit.NetworkSession.get_default()
+                else:
+                    self.network_session = WebKit.NetworkSession.get_default()
+            except AttributeError:
+                self.network_session = WebKit.NetworkSession.get_default()
+        return self.network_session or WebKit.NetworkSession.get_default()
+
+    def setup_proxy(self, webview):
+        if not self.is_running() and not self.start():
+            return False
+        if not self.tor_port:
+            self.tor_port = self.detect_tor_port()
+            if not self.tor_port:
+                return False
+        session = self._get_network_session(webview)
+        if session is None:
+            return False
+        proxy_uri = f"socks5://127.0.0.1:{self.tor_port}"
+        schemes = ["http", "https", "ftp", "ws", "wss"]
+        try:
+            proxy_settings = WebKit.NetworkProxySettings()
+            for scheme in schemes:
+                try:
+                    proxy_settings.add_proxy_for_scheme(scheme, proxy_uri)
+                except (TypeError, GLib.Error, AttributeError):
+                    os.environ['http_proxy'] = proxy_uri
+            os.environ['https_proxy'] = proxy_uri
+            os.environ['all_proxy'] = proxy_uri
+            session.set_proxy_settings(
+                WebKit.NetworkProxyMode.CUSTOM,
+                proxy_settings
+            )
+            env_proxy_uri = f"socks5://127.0.0.1:{self.tor_port}"
+            os.environ['http_proxy'] = env_proxy_uri
+            os.environ['https_proxy'] = env_proxy_uri
+            os.environ['ftp_proxy'] = env_proxy_uri
+            os.environ['all_proxy'] = f"socks5://127.0.0.1:{self.tor_port}"
+            return True
+        except (TypeError, GLib.Error, AttributeError):
+            try:
+                os.environ['http_proxy'] = proxy_uri
+                os.environ['https_proxy'] = proxy_uri
+                os.environ['ftp_proxy'] = proxy_uri
+                os.environ['all_proxy'] = proxy_uri
+                return True
+            except Exception:
+                return False
 
     def _start_new_tor_instance(self):
-        """Check if system Tor service is running and connect to it."""
-        print("Checking for system Tor service...")        
         try:
             result = subprocess.run(
                 ["systemctl", "is-active", "--quiet", "tor"],
                 capture_output=True,
                 text=True
-            )           
-            if result.returncode == 0:
-                print("System Tor service is running")                
+            )
+            if result.returncode != 0:
+                return False
+            try:
+                self.controller = Controller.from_port(port=9051)
                 try:
-                    self.controller = Controller.from_port(port=9051)
                     self.controller.authenticate()
-                    self.is_running_flag = True                    
-                    try:
-                        socks_ports = self.controller.get_conf('SocksPort', multiple=True)
-                        if socks_ports:
-                            actual_socks_port = socks_ports[0].split(':')[0]
-                            self.tor_port = int(actual_socks_port)
-                            print(f"Connected to system Tor on SOCKS port {self.tor_port}")
-                    except Exception as e:
-                        print(f"Warning: Could not determine SOCKS port: {e}")
-                        print("Using default SOCKS port 9050")
+                except Exception:
+                    self.controller.authenticate(password="shadow-browser")
+                self.is_running_flag = True
+                try:
+                    socks_ports = self.controller.get_conf("SocksPort", multiple=True)
+                    if socks_ports:
+                        self.tor_port = int(socks_ports[0].split(":")[0])
+                    else:
                         self.tor_port = 9050
-                    return True
-                except Exception as e:
-                    print(f"Error connecting to Tor control port: {e}")
-                    print("Make sure the system Tor service has ControlPort 9051 enabled")
-            else:
-                print("System Tor service is not running")
-                print("Please start the Tor service with: sudo systemctl start tor")                
+                except Exception:
+                    self.tor_port = 9050
+                return True
+            except Exception:
+                return False
         except FileNotFoundError:
-            print("systemctl not found, checking Tor process directly...")            
             if self._check_system_tor_running():
-                print("Found Tor running on standard port 9050")
                 self.tor_port = 9050
                 self.control_port = 9051
                 return True
-            else:
-                print("Could not find a running Tor instance")
-                print("Please install and start the Tor service")       
-        return False
+            return False
 
     def _print_bootstrap_lines(self, line=None):
-        """Print Tor bootstrap progress (stub for compatibility)."""
-        pass
+        if not hasattr(self, 'bootstrap_status'):
+            self.bootstrap_status = {
+                'progress': 0,
+                'tag': None,
+                'summary': 'Starting Tor...',
+                'warning': None,
+                'last_update': 0
+            }
+        current_time = time.time()
+        if line:
+            line = line.strip()
+            if not line:
+                return
+            if 'Bootstrapped' in line and '%' in line:
+                try:
+                    progress = int(line.split('%')[0].split()[-1])
+                    self.bootstrap_status['progress'] = min(100, max(0, progress))
+                    if '[' in line and ']' in line:
+                        tag_start = line.find('[') + 1
+                        tag_end = line.find(']')
+                        if tag_start < tag_end:
+                            self.bootstrap_status['tag'] = line[tag_start:tag_end].lower()
+                    if ':' in line:
+                        summary = line.split(':', 1)[1].strip()
+                        self.bootstrap_status['summary'] = summary
+                except (ValueError, IndexError):
+                    self.bootstrap_status['summary'] = line
+            elif any(w in line.lower() for w in ['warn', 'error', 'failed']):
+                self.bootstrap_status['warning'] = line
+        if current_time - self.bootstrap_status['last_update'] < 1.0 and line is not None:
+            return
+        self.bootstrap_status['last_update'] = current_time
+
+        def update_ui():
+            if not hasattr(self, 'status_bar'):
+                return
+            status_text = f"Tor: {self.bootstrap_status['summary']}"
+            if self.bootstrap_status['progress'] > 0:
+                status_text = f"[{self.bootstrap_status['progress']}%] {status_text}"
+            self.status_bar.push(0, status_text)
+            self.status_bar.push(0, status_text)
+            if self.bootstrap_status.get('warning'):
+                self.show_error_message(
+                    self.bootstrap_status['warning'],
+                    title="Tor Warning"
+                )
+                self.bootstrap_status['warning'] = None
+        if Gtk.main_level() > 0:
+            GLib.idle_add(update_ui)
+        else:
+            update_ui()
 
 class Tab:
-    def __init__(self, url, webview):
-        self.url = url
+    def __init__(self, url, webview, scrolled_window=None, favicon=None):
+        self.url = url or "about:blank"
         self.webview = webview
-        self.label_widget = None
+        self.scrolled_window = scrolled_window
+        self.favicon = favicon
+        self.label_box = None
+        self.favicon_widget = None
+        self.title_label = None
+        self.close_button = None
+        self.header_box = None
+        self.last_activity = time.time()
+        self.pinned = False
+        self.muted = False
 
-class SystemWakeLock:
-    def __init__(self, app_id="shadow-browser", reason="Browser is running"):
-        self._inhibit_cookie = None
-        self._dbus_inhibit = None
-        self._inhibit_method = None
-        self._app_id = app_id
-        self._reason = reason
-        self._setup_inhibit()
-
-    def _setup_inhibit(self):
-        """Set up the appropriate inhibition method for Linux."""
-        if platform.system() != 'Linux' or not dbus:
+    def update_favicon(self, favicon):
+        if not favicon:
             return
-        try:
-            DBusGMainLoop(set_as_default=True)
-            bus = dbus.SessionBus()
-            try:
-                portal = bus.get_object(
-                    "org.freedesktop.portal.Desktop",
-                    "/org/freedesktop/portal/desktop"
-                )
-                self._dbus_inhibit = dbus.Interface(
-                    portal, dbus_interface="org.freedesktop.portal.Inhibit"
-                )
-                self._inhibit_method = "portal"
-                return
-            except dbus.exceptions.DBusException as e:
-                if "org.freedesktop.DBus.Error.ServiceUnknown" not in str(e):
-                    print(f"Warning: DBus portal error: {e}")
-            try:
-                screensaver = bus.get_object(
-                    "org.freedesktop.ScreenSaver",
-                    "/org/freedesktop/ScreenSaver"
-                )
-                self._dbus_inhibit = dbus.Interface(
-                    screensaver, dbus_interface="org.freedesktop.ScreenSaver"
-                )
-                self._inhibit_method = "screensaver"
-                return
-            except dbus.exceptions.DBusException as e:
-                print(f"Warning: DBus screensaver error: {e}")
-        except Exception as e:
-            print(f"Warning: Failed to set up DBus: {e}")
+        self.favicon = favicon
+        if not self.favicon_widget:
+            self.favicon_widget = Gtk.Image()
+            self.favicon_widget.set_size_request(16, 16)
+            if self.label_box:
+                self.label_box.prepend(self.favicon_widget)
+                self.favicon_widget.set_visible(True)
+        if hasattr(favicon, 'get_type') and 'Gdk' in str(favicon.get_type()):
+            self.favicon_widget.set_from_paintable(favicon)
+        else:
+            if isinstance(favicon, GdkPixbuf.Pixbuf):
+                self.favicon_widget.set_from_pixbuf(favicon)
+            elif isinstance(favicon, str):
+                if os.path.exists(favicon) or favicon.startswith(('http://', 'https://', 'file://')):
+                    self.favicon_widget.set_from_file(favicon)
+            else:
+                if hasattr(favicon, 'get_paintable'):
+                    self.favicon_widget.set_from_paintable(favicon.get_paintable())
+                else:
+                    self.favicon_widget.set_from_paintable(favicon)
+        self.favicon_widget.set_visible(True)
 
-    def inhibit(self):
-        """Prevent system sleep/screensaver on Linux."""
-        if platform.system() != 'Linux':
-            print("Warning: Sleep inhibition is only supported on Linux")
-            return False
-        if not self._dbus_inhibit or not self._inhibit_method:
-            print("Warning: No inhibition method available")
-            return False
-        try:
-            if self._inhibit_method == "portal":
-                flags = 0x1
-                self._inhibit_cookie = self._dbus_inhibit.Inhibit(
-                    self._app_id,
-                    flags,
-                    dbus.Dictionary({
-                        'reason': dbus.String(self._reason),
-                        'application-name': dbus.String(self._app_id)
-                    }, signature='sv')
-                )
-                return True
-            elif self._inhibit_method == "screensaver":
-                self._inhibit_cookie = self._dbus_inhibit.Inhibit(self._app_id, self._reason)
-                return True
-        except Exception as e:
-            print(f"Warning: Could not inhibit sleep via DBus: {e}")
-            return False
+    def update_activity(self):
+        self.last_activity = time.time()
 
-    def uninhibit(self):
-        """Allow system sleep/screensaver again."""
-        if platform.system() != 'Linux' or not self._dbus_inhibit or self._inhibit_cookie is None:
-            return False
-        try:
-            if self._inhibit_method == "portal":
-                request_handle = str(self._inhibit_cookie)
-                try:
-                    bus = dbus.SessionBus()
-                    request = bus.get_object("org.freedesktop.portal.Desktop", request_handle)
-                    request.Close(dbus_interface="org.freedesktop.portal.Request")
-                    self._inhibit_cookie = None
-                    return True
-                except Exception as e:
-                    print(f"Warning: Failed to close portal request: {e}")
-                    return False
-            elif self._inhibit_method == "screensaver":
-                self._dbus_inhibit.UnInhibit(self._inhibit_cookie)
-                return True
-        except Exception as e:
-            print(f"Warning: Could not release DBus inhibition: {e}")
-            return False
-        finally:
-            self._inhibit_cookie = None
+    def __repr__(self):
+        return f"<Tab url='{self.url}' pinned={self.pinned} muted={self.muted}>"
 
 class ShadowBrowser(Gtk.Application):
-    def __init__(self):
-        super().__init__(application_id="com.shadowyfigure.shadowbrowser")
-        self.debug_mode = False
-        self.wake_lock = SystemWakeLock()
-        self.wake_lock_active = False
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.favicon_lock = threading.Lock()
+        self.favicon_cache = {}
+        self.settings_dialog = None
+        self.cookies_check = None
         self.webview = WebKit.WebView()
         self.content_manager = WebKit.UserContentManager()
         self.adblocker = AdBlocker()
         self.social_tracker_blocker = SocialTrackerBlocker()
         self.setup_webview_settings(self.webview)
+        try:
+            if hasattr(self.webview, 'connect'):
+                self.webview.connect('context-menu', self.on_webview_context_menu)
+                try:
+                    key_controller = Gtk.EventControllerKey()
+                    key_controller.connect('key-pressed', self.on_webview_key_press)
+                    self.webview.add_controller(key_controller)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         self.webview.connect("create", self.on_webview_create)
-        self.bookmarks = self.load_json(BOOKMARKS_FILE)
-        self.history = self.load_json(HISTORY_FILE)
+        bookmarks_data = self.load_json(BOOKMARKS_FILE, default=[])
+        self.bookmarks = bookmarks_data if isinstance(bookmarks_data, list) else []
+        self.history = self.load_json(HISTORY_FILE, default=[])
         self.tabs = []
         self.tabs_lock = threading.Lock()
         self.blocked_urls = []
         self.window = None
         self.notebook = Gtk.Notebook()
         self.url_entry = Gtk.Entry()
-        self.home_url = "https://duckduckgo.com/"
-        self.theme = "dark"
-        self.tor_enabled = True
-        self.tor_manager = None
-        self.tor_status = "disabled"
+        self.tor_enabled = self.load_json(SETTINGS_FILE, {}).get('tor_enabled', False)
         self.initialize_tor()
+        if self.tor_enabled and self.tor_manager and self.tor_manager.is_running():
+            tor_port = getattr(self.tor_manager, 'tor_port', 9050)
+            tor_proxy = f"socks5h://127.0.0.1:{tor_port}"
+            os.environ['http_proxy'] = tor_proxy
+            os.environ['https_proxy'] = tor_proxy
+            os.environ['all_proxy'] = tor_proxy
+            self.tor_status = "running"
         self.download_manager = DownloadManager(None)
         self.active_downloads = 0
         self.context = ssl.create_default_context()
@@ -1196,15 +1214,17 @@ class ShadowBrowser(Gtk.Application):
         self.download_spinner = Gtk.Spinner()
         self.download_spinner.set_visible(False)
         self.bookmark_menu = None
+        self.home_url = "https://duckduckgo.com/"
         self.setup_security_policies()
         self.download_manager.on_download_start_callback = self.on_download_start
         self.download_manager.on_download_finish_callback = self.on_download_finish
+        self.wake_lock_active = False
         try:
             self.adblocker.inject_to_webview(self.content_manager)
             self.inject_nonce_respecting_script()
             self.inject_remove_malicious_links()
             self.inject_adware_cleaner()
-            self.disable_biometrics_in_webview()
+            self.disable_biometrics_in_webview(self.content_manager)
             self.content_manager.register_script_message_handler("voidLinkClicked")
             self.content_manager.connect(
                 "script-message-received::voidLinkClicked", self.on_void_link_clicked
@@ -1219,67 +1239,50 @@ class ShadowBrowser(Gtk.Application):
             pass
 
     def initialize_tor(self, retry_count=0, max_retries=2):
-        """Initialize Tor with proper error handling and fallback mechanisms.       
-        Args:
-            retry_count: Current retry attempt
-            max_retries: Maximum number of retry attempts
-        Returns:
-            bool: True if Tor was successfully initialized, False otherwise
-        """
         if not self.tor_enabled:
+            self.tor_manager = None
             self.tor_status = "disabled"
-            return False           
+            return False
         try:
             if not self.tor_manager:
-                self.tor_manager = TorManager()               
+                self.tor_manager = TorManager()
             if self.tor_manager.is_running():
                 self.tor_status = "running"
-                return True               
+                return True
             if retry_count >= max_retries:
                 self.tor_status = "failed"
-                print("Error: Failed to start Tor after multiple attempts")
-                return False                
+                return False
             if self.tor_manager.start():
                 self.tor_status = "running"
                 tor_port = getattr(self.tor_manager, 'tor_port', 9050)
+                proxies = {
+                    'http': f'socks5h://127.0.0.1:{tor_port}',
+                    'https': f'socks5h://127.0.0.1:{tor_port}'
+                }
+                session = requests.Session()
+                session.proxies = proxies
                 try:
-                    session = requests.Session()
-                    session.proxies = {
-                        'http': f'socks5h://127.0.0.1:{tor_port}',
-                        'https': f'socks5h://127.0.0.1:{tor_port}'
-                    }
                     response = session.get('https://check.torproject.org/api/ip', timeout=30)
                     response.raise_for_status()
                     result = response.json()
                     if result.get('IsTor', False):
-                        print(f"Successfully connected to Tor on port {tor_port}")
                         self.tor_status = "running"
                         return True
                     else:
-                        print("Warning: Tor is running but not properly configured")
-                        print(f"Response: {result}")
                         self.tor_status = "misconfigured"
-                        return False                        
+                        return False
                 except requests.exceptions.RequestException as e:
-                    print(f"Tor connection test failed: {str(e)}")
                     if hasattr(e, 'response') and e.response is not None:
-                        print(f"Response status: {e.response.status_code}")
-                        print(f"Response text: {e.response.text[:500]}")
-                    return self.initialize_tor(retry_count + 1, max_retries)                    
+                        return self.initialize_tor(retry_count + 1, max_retries)
+                    return self.initialize_tor(retry_count + 1, max_retries)
             else:
-                print("Failed to start Tor process")
                 if retry_count < max_retries:
-                    print(f"Retrying Tor startup... (attempt {retry_count + 1}/{max_retries})")
                     if self.tor_manager:
                         self.tor_manager.stop()
                         self.tor_manager = None
                     return self.initialize_tor(retry_count + 1, max_retries)
-                return False               
-        except Exception as e:
-            import traceback
-            print(f"Unexpected error initializing Tor: {str(e)}")
-            print("Traceback:")
-            traceback.print_exc()           
+                return False
+        except Exception:
             self.tor_status = "error"
             if retry_count < max_retries:
                 if hasattr(self, 'tor_manager') and self.tor_manager:
@@ -1289,92 +1292,78 @@ class ShadowBrowser(Gtk.Application):
             return False
 
     def create_secure_webview(self):
-        """
-        Create a new secure WebView with all necessary scripts and handlers.
-        Returns:
-            WebKit.WebView: A configured WebView instance or None if creation fails
-        """
+        webview = None
         try:
-            content_manager = WebKit.UserContentManager()            
+            content_manager = WebKit.UserContentManager()
             webview = WebKit.WebView(user_content_manager=content_manager)
             webview.set_hexpand(True)
             webview.set_vexpand(True)
             webview._content_manager = content_manager
-            self._register_webview_message_handlers(webview)
-            self.adblocker.inject_to_webview(content_manager)
-            self.inject_nonce_respecting_script()
-            self.inject_remove_malicious_links()
-            self.inject_adware_cleaner()
-            self.disable_biometrics_in_webview(webview)
-            self.inject_mouse_event_script()
-            self.adblocker.enable_csp(webview)
-            webview.connect("create", self.on_webview_create)
-            return webview            
+            webview.connect('load-changed', self._on_webview_load_changed)
+            self.setup_webview_settings(webview)
+            context = webview.get_context()
+            if hasattr(context, 'get_soup_session'):
+                soup_session = context.get_soup_session()
+                if hasattr(soup_session, 'trust_env'):
+                    soup_session.trust_env = True
+        except Exception as e:
+            print(f"Error creating webview: {e}")
+            return None
+        if self.tor_enabled and self.tor_manager:
+            if not self.tor_manager.is_running():
+                self.initialize_tor()
+            if self.tor_manager.is_running():
+                web_context = webview.get_context()
+                self.tor_manager.setup_proxy(web_context)
+        self._register_webview_message_handlers(webview)
+        self.adblocker.inject_to_webview(content_manager)
+        self.adblocker.enable_csp(webview)
+        try:
+            self._setup_webview_handlers(webview)
         except Exception:
             pass
-            try:
-                webview = WebKit.WebView()
-                if not webview:
-                    print("Error: Failed to create WebView instance")
-                    return None
-                webview.set_hexpand(True)
-                webview.set_vexpand(True)
-                if not hasattr(webview, '_signal_handlers'):
-                    webview._signal_handlers = []
-                def on_destroy(webview, *args):
-                    self.cleanup_webview(webview)
-                handler_id = webview.connect('destroy', on_destroy)
-                webview._signal_handlers.append(handler_id)
-                return webview
-            except Exception as e:
-                print(f"Error creating WebView: {e}")
-                return None
-    
+        webview.connect("create", self.on_webview_create)
+        return webview
+
     def cleanup_webview(self, webview):
-        """
-        Clean up resources used by a WebView.
-        Args:
-            webview: The WebView to clean up
-        """
         if not webview:
-            return            
+            return
         try:
             for handler_id in getattr(webview, '_signal_handlers', []):
                 try:
                     webview.handler_disconnect(handler_id)
-                except Exception as e:
-                    print(f"Error disconnecting signal: {e}")            
+                except Exception:
+                    pass
             if hasattr(webview, '_content_manager'):
                 try:
                     content_manager = webview._content_manager
                     if hasattr(content_manager, 'remove_all_scripts'):
-                        content_manager.remove_all_scripts()                   
+                        content_manager.remove_all_scripts()
                     if hasattr(webview, '_handler_ids'):
                         for content_mgr, handler_id in webview._handler_ids:
                             if handler_id > 0 and content_mgr:
                                 try:
                                     content_mgr.disconnect(handler_id)
-                                except Exception as e:
-                                    print(f"Error disconnecting handler: {e}")
-                        del webview._handler_ids                       
+                                except Exception:
+                                    pass
+                        del webview._handler_ids
                     del webview._content_manager
-                except Exception as e:
-                    print(f"Error cleaning up content manager: {e}")            
+                except Exception:
+                    pass
             try:
                 webview.load_uri('about:blank')
                 if hasattr(webview, 'stop_loading'):
                     webview.stop_loading()
                 if hasattr(webview, 'load_html_string'):
                     webview.load_html_string('', 'about:blank')
-            except Exception as e:
-                print(f"Error clearing WebView content: {e}")            
+            except Exception:
+                pass
             parent = webview.get_parent()
             if parent:
                 parent.remove(webview)
-        except Exception as e:
-            print(f"Error during WebView cleanup: {e}")
+        except Exception:
+            pass
         finally:
-            import gc
             gc.collect()
 
     def _register_webview_message_handlers(self, webview):
@@ -1427,7 +1416,7 @@ class ShadowBrowser(Gtk.Application):
     def on_download_start(self):
         try:
             if not self.download_spinner:
-                return               
+                return
             self.active_downloads += 1
             if self.active_downloads == 1:
                 GLib.idle_add(self.download_spinner.start)
@@ -1438,7 +1427,7 @@ class ShadowBrowser(Gtk.Application):
     def on_download_finish(self):
         try:
             if not self.download_spinner:
-                return               
+                return
             if self.active_downloads > 0:
                 self.active_downloads -= 1
             if self.active_downloads == 0:
@@ -1448,7 +1437,6 @@ class ShadowBrowser(Gtk.Application):
             pass
 
     def setup_security_policies(self):
-        """Setup comprehensive security policies for the browser."""
         self.blocked_urls.extend(
             [
                 "accounts.google.com/gsi/client",
@@ -1461,137 +1449,143 @@ class ShadowBrowser(Gtk.Application):
         )
 
     def inject_security_headers(self, webview, load_event):
-        """
-        Configure WebView for optimal media playback and inject security headers.        
-        This method ensures all necessary media-related settings are enabled and properly
-        configured for smooth video and audio playback while maintaining security.
-        """
-        if load_event == WebKit.LoadEvent.STARTED:
+        if load_event != WebKit.LoadEvent.STARTED:
+            return False
+        uri = webview.get_uri()
+        if not uri:
+            return False
+        if not (uri.startswith(('http:', 'https:', 'blob:'))):
+            return False
+        if any(blocked_url in uri.lower() for blocked_url in self.blocked_urls):
+            return True
+        settings = webview.get_settings()
+        try:
+            default_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent = settings.get_property('user-agent') or default_ua
+            if 'SecurityBrowser' not in user_agent:
+                settings.set_property("user-agent", f"{user_agent} SecurityBrowser/1.0")
+        except Exception:
+            pass
+        core_settings = {
+            "enable-javascript": True,
+            "enable-page-cache": True,
+            "enable-smooth-scrolling": True,
+            "enable-fullscreen": True,
+            "auto-load-images": True,
+            "enable-media": True,
+            "enable-media-stream": True,
+            "enable-webaudio": True,
+            "enable-webgl": True,
+            "enable-java": False,
+            "enable-plugins": False,
+            "enable-html5-database": False,
+            "enable-html5-local-storage": True,
+            "enable-site-specific-quirks": True,
+            "enable-universal-access-from-file-uris": False,
+            "allow-file-access-from-file-urls": False,
+            "allow-universal-access-from-file-urls": False,
+            "enable-developer-extras": False,
+            "enable-write-console-messages-to-stdout": False,
+        }
+        for k, v in core_settings.items():
+            settings.set_property(k, v)
+        if hasattr(settings, "set_hardware_acceleration_policy"):
+            if hasattr(WebKit, "HardwareAccelerationPolicy"):
+                settings.set_hardware_acceleration_policy(
+                    WebKit.HardwareAccelerationPolicy.ALWAYS
+                )
+        accel_settings = [
+            "enable-accelerated-compositing",
+            "enable-accelerated-video",
+            "enable-accelerated-video-decode",
+            "enable-accelerated-webgl",
+            "enable-webrtc-hw-decoding",
+            "enable-webrtc-hw-encoding"
+        ]
+        for accel_flag in accel_settings:
             try:
-                uri = webview.get_uri()
-                if not uri:
-                    return False
-                if not (uri.startswith(('http:', 'https:', 'blob:'))):
-                    return False
-                if any(blocked_url in uri.lower() for blocked_url in self.blocked_urls):
-                    return True
-                settings = webview.get_settings()
-                try:
-                    user_agent = settings.get_property('user-agent') or ''
-                    if 'SecurityBrowser' not in user_agent:
-                        settings.set_property('user-agent', f"{user_agent} SecurityBrowser/1.0")
-                except Exception as e:
-                    if self.debug_mode:
-                        print(f"Warning: Could not set user agent: {str(e)}")
-                core_settings = {
-                    'enable-javascript': True,
-                    'enable-page-cache': True,
-                    'enable-smooth-scrolling': True,
-                    'enable-fullscreen': True,
-                    'enable-media': True,
-                    'enable-media-stream': True,
-                    'enable-mediasource': True,
-                    'enable-encrypted-media': True,
-                    'enable-webrtc': True,
-                    'enable-webgl': True,
-                    'enable-webaudio': True,
-                    'media-playback-requires-user-gesture': False,
-                    'auto-load-images': True,
-                    'enable-java': False,
-                    'enable-plugins': False,
-                    'enable-html5-database': False,
-                    'enable-html5-local-storage': True,
-                    'enable-site-specific-quirks': True,
-                    'enable-universal-access-from-file-uris': False,
-                    'enable-xss-auditor': True,
-                    'enable-web-security': True,
-                    'allow-file-access-from-file-urls': False,
-                    'allow-universal-access-from-file-urls': False,
-                    'enable-developer-extras': self.debug_mode,
-                    'enable-write-console-messages-to-stdout': self.debug_mode,
-                    'enable-javascript-markup': True,
-                    'enable-media-capabilities': True,
-                    'enable-media-playback-requires-user-gesture': False,
-                    'enable-media-source': True
+                settings.set_property(accel_flag, True)
+            except (TypeError, ValueError):
+                pass
+        if hasattr(settings, "set_auto_play_policy"):
+            settings.set_auto_play_policy(WebKit.AutoPlayPolicy.ALLOW)
+        if hasattr(settings, "set_webrtc_ip_handling_policy"):
+            settings.set_webrtc_ip_handling_policy(
+                WebKit.WebRTCIPHandlingPolicy.DEFAULT_PUBLIC_AND_PRIVATE_INTERFACES
+            )
+        if hasattr(settings, "set_media_playback_requires_user_gesture"):
+            settings.set_media_playback_requires_user_gesture(False)
+        if hasattr(settings, "set_media_playback_allows_inline"):
+            settings.set_media_playback_allows_inline(True)
+        if hasattr(settings, "set_enable_media"):
+            settings.set_enable_media(True)
+        if hasattr(settings, "set_enable_mediasource"):
+            settings.set_enable_mediasource(True)
+        if hasattr(settings, "set_enable_media_capabilities"):
+            settings.set_enable_media_capabilities(True)
+        if hasattr(settings, "set_enable_encrypted_media"):
+            settings.set_enable_encrypted_media(True)
+        if hasattr(settings, "set_media_content_types_requiring_hardware_support"):
+            settings.set_media_content_types_requiring_hardware_support("video/.*")
+        webview.set_settings(settings)
+        return False
+
+    def _inject_videojs_support(self, webview):
+        videojs_init_script = """
+        function initVideoJS() {
+            const videos = document.querySelectorAll('video.video-js:not(.vjs-has-started)');
+            videos.forEach(video => {
+                try {
+                    if (!video.classList.contains('vjs-has-started')) {
+                        const player = videojs(video, {
+                            controls: true,
+                            autoplay: 'muted',
+                            preload: 'auto'
+                        });
+                        video.classList.add('vjs-has-started');
+                    }
+                } catch (e) {
+                    console.error('Video.js initialization error:', e);
                 }
-                for prop, value in core_settings.items():
-                    try:
-                        settings.set_property(prop, value)
-                    except Exception as e:
-                        if self.debug_mode:
-                            print(f"Warning: Could not set {prop}: {str(e)}")
-                try:                
-                    if hasattr(settings, 'set_hardware_acceleration_policy'):
-                        try:
-                            if hasattr(WebKit, 'HardwareAccelerationPolicy'):
-                                settings.set_hardware_acceleration_policy(WebKit.HardwareAccelerationPolicy.ALWAYS)
-                            else:
-                                settings.set_hardware_acceleration_policy(1)
-                        except (AttributeError, TypeError):
-                            try:
-                                settings.set_hardware_acceleration_policy(1)
-                            except (AttributeError, TypeError, GLib.Error) as accel_error:
-                                if self.debug_mode:
-                                    print(f"Warning: Could not set hardware acceleration policy (fallback): {str(accel_error)}")
-                    for setting in [
-                        'hardware-acceleration-policy',
-                        'enable-hardware-acceleration',
-                        'enable-accelerated-compositing',
-                        'enable-accelerated-2d-canvas',
-                        'enable-webgl'
-                    ]:
-                        try:
-                            settings.set_property(setting, True)
-                        except (AttributeError, TypeError, GLib.Error) as prop_error:
-                            if self.debug_mode:
-                                print(f"Warning: Could not set {setting}: {str(prop_error)}")
-                            continue        
-                except Exception as e:
-                    if self.debug_mode:
-                        print(f"Warning: Could not set hardware acceleration policy: {str(e)}")
-                if hasattr(settings, 'set_auto_play_policy'):
-                    try:
-                        settings.set_auto_play_policy(WebKit.AutoPlayPolicy.ALLOW)
-                    except Exception as e:
-                        if self.debug_mode:
-                            print(f"Warning: Could not set autoplay policy: {str(e)}")
-                if hasattr(settings, 'set_webrtc_ip_handling_policy'):
-                    try:
-                        settings.set_webrtc_ip_handling_policy(
-                            WebKit.WebRTCIPHandlingPolicy.DEFAULT_PUBLIC_AND_PRIVATE_INTERFACES)
-                    except Exception as e:
-                        if self.debug_mode:
-                            print(f"Warning: Could not set WebRTC policy: {str(e)}")
-                webview.set_settings(settings)
-                if hasattr(settings, 'set_enable_media_cache'):
-                    settings.set_enable_media_cache(True)
-                if hasattr(settings, 'set_enable_mediasource'):
-                    settings.set_enable_mediasource(True)
-                settings.set_enable_smooth_scrolling(True)
-                if hasattr(WebKit, 'HardwareAccelerationPolicy') and hasattr(WebKit.HardwareAccelerationPolicy, 'ALWAYS'):
-                    settings.set_hardware_acceleration_policy(WebKit.HardwareAccelerationPolicy.ALWAYS)
-                elif hasattr(WebKit, 'HardwareAccelerationPolicy') and hasattr(WebKit.HardwareAccelerationPolicy, 'ON'):
-                    settings.set_hardware_acceleration_policy(WebKit.HardwareAccelerationPolicy.ON)
-                else:
-                    try:
-                        settings.set_hardware_acceleration_policy(1)
-                    except (AttributeError, TypeError, GLib.Error): 
-                        pass
-                if hasattr(settings, 'set_enable_hardware_accelerated_video_decode'):
-                    settings.set_enable_hardware_accelerated_video_decode(True)
-                settings.set_enable_webaudio(True)
-                settings.set_enable_webgl(True)
-                if hasattr(settings, 'set_enable_webgl2'):
-                    settings.set_enable_webgl2(True)
-                if hasattr(settings, 'set_enable_webaudio'):
-                    settings.set_enable_webaudio(True)
-                return False
-            except Exception as e:
-                print(f"Error in inject_security_headers: {str(e)}")
-                return False
+            });
+        }
+        function unmuteOnGesture() {
+            function handler() {
+                try {
+                    document.querySelectorAll('video').forEach(v => {
+                        try { v.muted = false; if (v.volume === 0) v.volume = 0.5; } catch(e) {}
+                    });
+                    if (window.videojs && typeof videojs.getAllPlayers === 'function') {
+                        try {
+                            const players = videojs.getAllPlayers();
+                            Object.keys(players).forEach(k => {
+                                try { players[k].muted(false); players[k].volume(0.5); } catch(e) {}
+                            });
+                        } catch(e) {}
+                    }
+                } catch(e) {}
+                window.removeEventListener('click', handler);
+                window.removeEventListener('touchstart', handler);
+            }
+            window.addEventListener('click', handler, {once: true});
+            window.addEventListener('touchstart', handler, {once: true});
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() { initVideoJS(); unmuteOnGesture(); });
+        } else {
+            initVideoJS(); unmuteOnGesture();
+        }
+        const observer = new MutationObserver((mutations) => {
+            initVideoJS();
+        });
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+        """
+        webview.evaluate_javascript(videojs_init_script, -1, None, None, None)
 
     def block_social_trackers(self, webview, decision, decision_type):
-        """Block social media trackers."""
         if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
             nav_action = decision.get_navigation_action()
             uri = nav_action.get_request().get_uri()
@@ -1604,11 +1598,6 @@ class ShadowBrowser(Gtk.Application):
         return False
 
     def uuid_to_token(self, uuid_str: str) -> str:
-        """
-        Convert a UUID string to a short base64url token.
-        """
-        import base64
-        import uuid
         try:
             u = uuid.UUID(uuid_str)
             b = u.bytes
@@ -1618,24 +1607,23 @@ class ShadowBrowser(Gtk.Application):
             return uuid_str
 
     def transform_embed_selector_links(self, html_content: str) -> str:
-        """
-        Transform UUIDs in <a> tags with class 'embed-selector asg-hover even' and onclick handlers
-        by replacing UUIDs with short tokens in the onclick attribute.        
-        Returns:
-            str: The transformed HTML content with UUIDs replaced by tokens
-        """
-        import re
-        uuid_pattern = r'onclick="[^"]*([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})[^"]*"'
         def replace_uuid(match):
+            original = match.group(0)
             uuid_str = match.group(1)
-            try:
-                return f'onclick="{self.uuid_to_token(uuid_str)}"'
-            except Exception:
-                return match.group(0)
-        return re.sub(uuid_pattern, replace_uuid, html_content, flags=re.IGNORECASE)
+            token = self.uuid_to_token(uuid_str)
+            replaced = original.replace(uuid_str, token)
+            return replaced
+        pattern = r"onclick=\"window\.open\(dbneg\('([0-9a-fA-F\-]+)'\)"
+        transformed_html = re.sub(pattern, replace_uuid, html_content)
+        return transformed_html
+
+    def dbneg(self, id_string: str) -> str:
+        base_url = "https://example.com/dbneg?ids="
+        import urllib.parse
+        encoded_ids = urllib.parse.quote(id_string)
+        return base_url + encoded_ids
 
     def inject_window_open_handler(self, content_manager):
-        """Inject JS to override window.open and send URLs to Python for new tab opening."""
         js_code = '''
         (function() {
             console.log('[ShadowBrowser] Injecting window.open override');
@@ -1657,13 +1645,8 @@ class ShadowBrowser(Gtk.Application):
             };
         })();
         '''
-        print('[ShadowBrowser] Injecting window.open handler JS')
         content_manager.add_script(
-            WebKit.UserScript.new(
-                js_code,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit.UserScriptInjectionTime.START,
-            )
+            self._create_user_script(js_code)
         )
 
     def _register_webview_message_handlers(self, webview):
@@ -1684,32 +1667,23 @@ class ShadowBrowser(Gtk.Application):
         webview._handler_ids.append((content_manager, handler_id2))
 
     def on_window_open_handler(self, user_content_manager, js_message):
-        """Handle window.open JS calls and open the URL in a new tab."""
-        print('[ShadowBrowser] Python window.open handler triggered')
-        try:
-            data = js_message.get_js_value() if hasattr(js_message, 'get_js_value') else js_message
-            print(f'[ShadowBrowser] JS message data: {data!r}')
-            url = None
-            if isinstance(data, dict):
-                url = data.get('url')
-            elif isinstance(data, str):
-                url = data
-            if url is None:
-                print('[ShadowBrowser] No URL received from JS (None)')
-            elif not isinstance(url, str):
-                print(f'[ShadowBrowser] URL received is not a string: {url!r}')
-                url = str(url)
+        data = js_message.get_js_value() if hasattr(js_message, 'get_js_value') else js_message
+        url = None
+        if isinstance(data, dict):
+            url = data.get('url')
+        elif isinstance(data, str):
+            url = data
+        if url is None:
+            pass
+        elif not isinstance(url, str):
+            url = str(url)
             url = url.strip() if isinstance(url, str) else ''
-            print(f'[ShadowBrowser] window.open URL to open (after strip): {url!r}')
             if url:
                 self.open_url_in_new_tab(url)
             else:
-                print('[ShadowBrowser] No valid URL provided to open_url_in_new_tab (empty or blank)')
-        except Exception as e:
-            print(f'[ShadowBrowser] Exception in on_window_open_handler: {e}')
+                pass
 
     def get_current_webview(self):
-        """Return the webview of the currently active tab."""
         current_page = self.notebook.get_current_page()
         if current_page == -1:
             return None
@@ -1730,11 +1704,274 @@ class ShadowBrowser(Gtk.Application):
         replaced = original.replace(uuid_str, token)
         return replaced
 
-    def on_webview_console_message(self, webview, level, message, line, source_id):
-        pass
+    def _handle_syntax_error(self, webview, source_id, message):
+        recovery_script = """
+        (function() {
+            // Try to identify and fix common syntax issues
+            console.log('[WebKitGTK Recovery] Attempting to fix syntax errors...');
+            // Add missing closing brackets for common patterns
+            if (typeof window.fixSyntaxErrors === 'undefined') {
+                window.fixSyntaxErrors = function() {
+                    // Common fixes for incomplete JS
+                    try {
+                        // Fix incomplete function calls
+                        var scripts = document.querySelectorAll('script');
+                        scripts.forEach(function(script) {
+                            if (script.src && script.src.includes('xnxx.header.static.js')) {
+                                console.log('[WebKitGTK Recovery] Detected problematic script, attempting recovery...');
+                            }
+                        });
+                    } catch(e) {
+                        console.log('[WebKitGTK Recovery] Fix attempt failed:', e);
+                    }
+                };
+                // Run the fix after page load
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', window.fixSyntaxErrors);
+                } else {
+                    setTimeout(window.fixSyntaxErrors, 100);
+                }
+            }
+        })();
+        """ 
+        webview.evaluate_javascript(recovery_script, -1, None, None, None)
 
-    def on_console_message_received(self, user_content_manager, js_message):
-        pass
+    def _handle_reference_error(self, webview, message, source_id):
+        match = re.search(r'ReferenceError:\s*(\w+)\s+is not defined', message)
+        if match:
+            var_name = match.group(1)
+            polyfill_script = f"""
+            (function() {{
+                console.log('[WebKitGTK Recovery] Providing missing variable: {var_name}');
+                // Common missing variables for adult sites
+                if (typeof {var_name} === 'undefined') {{
+                    {self._get_polyfill_for_variable(var_name)}
+                }}
+            }})();
+            """
+            webview.evaluate_javascript(polyfill_script, -1, None, None, None)
+
+    def _handle_storage_warning(self, webview, message):
+        storage_polyfill = """
+        (function() {
+            console.log('[WebKitGTK Recovery] Applying storage polyfills...');
+            // Enhanced cookie polyfill for WebKitGTK
+            if (typeof document.originalCookie === 'undefined') {
+                document.originalCookie = document.cookie || '';
+                Object.defineProperty(document, 'cookie', {
+                    get: function() {
+                        return document.originalCookie;
+                    },
+                    set: function(value) {
+                        try {
+                            document.originalCookie = value;
+                            // Try to set cookie via WebKit method if available
+                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.setCookie) {
+                                window.webkit.messageHandlers.setCookie.postMessage(value);
+                            }
+                        } catch(e) {
+                            console.log('[Cookie Polyfill] Warning:', e);
+                        }
+                    }
+                });
+            }
+            // localStorage polyfill with enhanced compatibility
+            if (typeof window.localStorage === 'undefined') {
+                window.localStorage = {
+                    _data: {},
+                    setItem: function(key, value) {
+                        try {
+                            this._data[key] = String(value);
+                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.localStorage) {
+                                window.webkit.messageHandlers.localStorage.postMessage({action: 'setItem', key: key, value: value});
+                            }
+                        } catch(e) { console.log('[localStorage] Warning:', e); }
+                    },
+                    getItem: function(key) {
+                        try {
+                            return this._data.hasOwnProperty(key) ? this._data[key] : null;
+                        } catch(e) { return null; }
+                    },
+                    removeItem: function(key) {
+                        try {
+                            delete this._data[key];
+                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.localStorage) {
+                                window.webkit.messageHandlers.localStorage.postMessage({action: 'removeItem', key: key});
+                            }
+                        } catch(e) { console.log('[localStorage] Warning:', e); }
+                    },
+                    clear: function() {
+                        try {
+                            this._data = {};
+                            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.localStorage) {
+                                window.webkit.messageHandlers.localStorage.postMessage({action: 'clear'});
+                            }
+                        } catch(e) { console.log('[localStorage] Warning:', e); }
+                    },
+                    get length() {
+                        return Object.keys(this._data).length;
+                    },
+                    key: function(index) {
+                        try {
+                            return Object.keys(this._data)[index] || null;
+                        } catch(e) { return null; }
+                    }
+                };
+            }
+            // sessionStorage polyfill
+            if (typeof window.sessionStorage === 'undefined') {
+                window.sessionStorage = {
+                    _data: {},
+                    setItem: function(key, value) {
+                        try { this._data[key] = String(value); } catch(e) { console.log('[sessionStorage] Warning:', e); }
+                    },
+                    getItem: function(key) {
+                        try { return this._data.hasOwnProperty(key) ? this._data[key] : null; } catch(e) { return null; }
+                    },
+                    removeItem: function(key) {
+                        try { delete this._data[key]; } catch(e) { console.log('[sessionStorage] Warning:', e); }
+                    },
+                    clear: function() {
+                        try { this._data = {}; } catch(e) { console.log('[sessionStorage] Warning:', e); }
+                    },
+                    get length() {
+                        return Object.keys(this._data).length;
+                    },
+                    key: function(index) {
+                        try { return Object.keys(this._data)[index] || null; } catch(e) { return null; }
+                    }
+                };
+            }
+        })();
+        """
+        webview.evaluate_javascript(storage_polyfill, -1, None, None, None)
+
+    def _get_polyfill_for_variable(self, var_name):
+        """Get polyfill code for common missing variables"""
+        polyfills = {
+            'agego_aver': 'window.agego_aver = "true";',
+            'dbneg': '''window.dbneg = function(id) {
+                console.log('[Polyfill] dbneg called with id:', id);
+                // Try to extract URL from common obfuscation patterns
+                try {
+                    var elements = document.querySelectorAll('[data-id="' + id + '"], [onclick*="' + id + '"]');
+                    if (elements.length > 0) {
+                        var onclick = elements[0].getAttribute('onclick') || '';
+                        var match = onclick.match(/['"]([^'"]+)['"]/);
+                        return match ? match[1] : 'about:blank';
+                    }
+                } catch(e) { console.log('[dbneg] Error:', e); }
+                return 'about:blank';
+            };''',
+            'pl_': 'window.pl_ = {};',
+            'ex_': 'window.ex_ = {};',
+            'videoPlayer': '''window.videoPlayer = {
+                play: function() { console.log('[Polyfill] videoPlayer.play() called'); },
+                pause: function() { console.log('[Polyfill] videoPlayer.pause() called'); },
+                load: function() { console.log('[Polyfill] videoPlayer.load() called'); }
+            };''',
+        }
+        return polyfills.get(var_name, f'window.{var_name} = {{}};')
+
+    def on_webview_console_message(self, webview, console_message):
+        """Enhanced console message handler for WebKitGTK JS debugging"""
+        try:
+            if hasattr(console_message, 'get_text'):
+                message = console_message.get_text()
+            else:
+                message = str(console_message)
+            if hasattr(console_message, 'get_source_id'):
+                source_id = console_message.get_source_id()
+            else:
+                source_id = "unknown"
+            if hasattr(console_message, 'get_line'):
+                line = console_message.get_line()
+            else:
+                line = 0
+            if hasattr(console_message, 'get_level'):
+                level = console_message.get_level()
+            else:
+                level = 1
+            if any(msg in message for msg in [
+                'Unknown logging channel:',
+                'The resource was preloaded using link preload',
+                'was preloaded using link preload',
+                'DevTools listening on',
+                'Document was loaded from',
+                'Consider using',
+                'Third-party cookie'
+            ]):
+                return True
+            if any(error in message for error in [
+                'SyntaxError:',
+                'ReferenceError:',
+                'TypeError:',
+                'Unexpected EOF',
+                'Unexpected token',
+                'Unexpected identifier',
+                'Unexpected end of input'
+            ]):
+                print(f"[WebKitGTK JS Error] {level}: {message} at {source_id}:{line}")
+                if 'Unexpected EOF' in message or 'Unexpected end of input' in message:
+                    self._handle_syntax_error(webview, source_id, message)
+                if 'ReferenceError:' in message:
+                    self._handle_reference_error(webview, message, source_id)
+                return False
+            if any(warning in message for warning in [
+                'cookie',
+                'localStorage',
+                'sessionStorage',
+                'document.cookie'
+            ]):
+                self._handle_storage_warning(webview, message)
+                return True
+        except Exception:
+            return False
+
+    def _create_user_script(self, js_code, injection_time=WebKit.UserScriptInjectionTime.START,
+                           frames=WebKit.UserContentInjectedFrames.ALL_FRAMES):
+        return WebKit.UserScript.new(
+            js_code,
+            frames,
+            injection_time,
+        )
+
+    def on_webview_create(self, webview, navigation_action):
+        try:
+            return None
+        except Exception:
+            return None
+
+    def _setup_webview_handlers(self, webview):
+        if hasattr(webview, 'connect'):
+            webview.connect('context-menu', self.on_webview_context_menu)
+            key_controller = Gtk.EventControllerKey()
+            key_controller.connect('key-pressed', self.on_webview_key_press)
+            webview.add_controller(key_controller)
+        webview.connect('notify::favicon', self._on_favicon_changed)
+        if not hasattr(self, '_original_load_changed'):
+            self._original_load_changed = webview.connect('load-changed', self._on_webview_load_changed)
+        webview.connect("create", self.on_webview_create)
+        webview.connect('resource-load-started', self.on_resource_load_started)
+
+    def _configure_common_webview_settings(self, settings, webview):
+        settings.set_enable_javascript(True)
+        if hasattr(settings, 'set_enable_html5_local_storage'):
+            settings.set_enable_html5_local_storage(True)
+        if hasattr(settings, 'set_enable_html5_database'):
+            settings.set_enable_html5_database(True)
+        if hasattr(settings, 'set_auto_load_images'):
+            settings.set_auto_load_images(True)
+        if hasattr(settings, 'set_enable_smooth_scrolling'):
+            settings.set_enable_smooth_scrolling(True)
+        if hasattr(settings, 'set_enable_fullscreen'):
+            settings.set_enable_fullscreen(True)
+        if hasattr(settings, 'set_enable_developer_extras'):
+            settings.set_enable_developer_extras(False)
+        if hasattr(settings, 'set_enable_private_browsing'):
+            settings.set_enable_private_browsing(False)
+        if hasattr(settings, 'set_enable_write_console_messages_to_stdout'):
+            settings.set_enable_write_console_messages_to_stdout(False)
 
     def inject_video_ad_skipper(self, webview):
         js_code = """
@@ -1764,12 +2001,8 @@ class ShadowBrowser(Gtk.Application):
         webview.get_user_content_manager().add_script(script)
 
     def _process_clicked_url(self, url, metadata):
-        """
-        Process a clicked URL with the given metadata.       
-        Args:
-            url: The URL that was clicked
-            metadata: Additional metadata about the click event
-        """
+        if not url:
+            return
         try:
             if url.startswith('/'):
                 current_uri = self.webview.get_uri()
@@ -1782,229 +2015,260 @@ class ShadowBrowser(Gtk.Application):
             self.open_url_in_new_tab(url)
         except Exception:
             pass
-    
+
     def on_javascript_finished(self, webview, result, user_data):
-        """Handle the result of JavaScript execution."""
-        try:
-            js_result = webview.run_javascript_finish(result)
-            if js_result:
-                value = js_result.get_js_value()
-                if value and value.is_string():
-                    print(f"JavaScript result: {value.to_string()}")
-                else:
-                    print("JavaScript executed, no string return value")
-        except Exception as e:
-            print(f"Error executing JavaScript: {e}")
-    
+        js_result = webview.evaluate_javascript_finish(result)
+        if js_result:
+            value = js_result.get_js_value()
+            if value and value.is_string():
+                pass
+            else:
+                pass
+
+    def _extract_url_from_message(self, message_data):
+        if message_data is None:
+            return None, {}
+        if hasattr(message_data, 'is_string') and message_data.is_string():
+            return message_data.to_string(), {'url': message_data.to_string()}
+        if isinstance(message_data, str):
+            try:
+                parsed = json.loads(message_data)
+                if isinstance(parsed, dict):
+                    return self._extract_url_from_dict(parsed)
+                return str(parsed), {'url': str(parsed)}
+            except (json.JSONDecodeError, TypeError):
+                return message_data, {'url': message_data}
+        if isinstance(message_data, dict):
+            return self._extract_url_from_dict(message_data)
+        return None, {}
+
+    def _extract_url_from_dict(self, data):
+        if not isinstance(data, dict):
+            return None, {}
+        url = data.get('url', '')
+        if not url and 'message' in data:
+            url = data.get('message', '')
+        return url, data.copy()
+
     def on_void_link_clicked(self, user_content_manager, js_message):
-        """
-        Handle clicks on void links and other clickable elements that don't have direct hrefs.       
-        Args:
-            user_content_manager: The WebKit.UserContentManager that received the message
-            js_message: The message containing click data from JavaScript
-        """
-        try:
-            print("[VOID_LINK_CLICKED] Triggered")
-            if hasattr(js_message, 'get_js_value'):
-                message_data = js_message.get_js_value()
-                print(f"[VOID_LINK_CLICKED] js_message.get_js_value(): {message_data}")
-                if hasattr(message_data, 'to_dict') and callable(getattr(message_data, 'to_dict')):
-                    message_data = message_data.to_dict()
-                elif isinstance(message_data, str):
-                    try:
-                        message_data = json.loads(message_data)
-                    except Exception as e:
-                        print(f"[VOID_LINK_CLICKED] JSON decode error: {e}")
-                url = None
-                metadata = {}
-                if isinstance(message_data, dict):
-                    url = message_data.get('url', '')
-                    metadata = message_data
-                    if not url and 'message' in message_data:
-                        url = message_data['message']
-                elif isinstance(message_data, str):
-                    url = message_data
-                    metadata = {'url': url}
-                print(f"[VOID_LINK_CLICKED] url: {url}, metadata: {metadata}")
-                if url and url != "about:blank":
-                    print(f"[VOID_LINK_CLICKED] Calling _process_clicked_url with url: {url}")
-                    GLib.idle_add(self._process_clicked_url, str(url), metadata)
-                    return
-            else:
-                message_data = js_message
-                print(f"[VOID_LINK_CLICKED] js_message (no get_js_value): {message_data}")
-            url = None
-            metadata = {}
-            if isinstance(message_data, dict):
-                url = message_data.get('url', '')
-                metadata = message_data
-                if not url and 'message' in message_data:
-                    url = message_data['message']
-            elif isinstance(message_data, str):
-                url = message_data
-                metadata = {'url': url}
-            elif hasattr(message_data, 'is_string') and message_data.is_string():
-                url = message_data.to_string()
-                metadata = {'url': url}
-            print(f"[VOID_LINK_CLICKED] url: {url}, metadata: {metadata}")
-            if url and url != "about:blank":
-                print(f"[VOID_LINK_CLICKED] Calling _process_clicked_url with url: {url}")
-                GLib.idle_add(self._process_clicked_url, str(url), metadata)
-                return
-            if not url or url == "about:blank":
-                print("[VOID_LINK_CLICKED] No valid URL, opening about:blank as fallback.")
-                GLib.idle_add(self._process_clicked_url, "about:blank", metadata)
-                return
-        except Exception as e:
-            print(f"Error in on_void_link_clicked: {e}")
-            import traceback
-            traceback.print_exc()
-        try:
-            print(f"[PROCESS_CLICKED_URL] url: {url}, metadata: {metadata}")
-            if url is not None:
-                if url.startswith('/'):
-                    current_uri = self.webview.get_uri()
-                    print(f"[PROCESS_CLICKED_URL] current_uri: {current_uri}")
-                    if current_uri:
-                        from urllib.parse import urljoin
-                        abs_url = urljoin(current_uri, url)
-                        print(f"[PROCESS_CLICKED_URL] abs_url: {abs_url}")
-                        url = abs_url
-                if url.startswith('javascript:'):
-                    print("[PROCESS_CLICKED_URL] Ignoring javascript: url")
-                    return
-                print(f"[PROCESS_CLICKED_URL] Opening in new tab: {url}")
-                self.open_url_in_new_tab(url)
-            else:
-                print("[PROCESS_CLICKED_URL] url is None, skipping.")
-        except Exception as e:
-            print(f"[PROCESS_CLICKED_URL] Exception: {e}")
-            import traceback
-            traceback.print_exc()
-    
+        if hasattr(js_message, 'get_js_value'):
+            message_data = js_message.get_js_value()
+            if hasattr(message_data, 'to_dict') and callable(getattr(message_data, 'to_dict')):
+                message_data = message_data.to_dict()
+        else:
+            message_data = js_message
+        url, metadata = self._extract_url_from_message(message_data)
+        if url and url != "about:blank":
+            GLib.idle_add(self._process_clicked_url, url, metadata)
+
     def setup_webview_settings(self, webview):
-        """Configure WebView settings for security, compatibility, and performance."""
-        settings = webview.get_settings()
-        settings.set_property("enable-developer-extras", self.debug_mode)
-        settings.set_enable_developer_extras(self.debug_mode)
-        settings.set_enable_javascript(True)
-        settings.set_enable_page_cache(True)
-        settings.set_enable_smooth_scrolling(True)
-        settings.set_enable_fullscreen(False)
-        settings.set_enable_media(True)
-        settings.set_enable_media_capabilities(True)
-        settings.set_enable_media_stream(True)
-        settings.set_enable_mediasource(True)
-        settings.set_enable_encrypted_media(True)
-        settings.set_enable_webrtc(True)
-        for attr in dir(settings):
-            if attr.startswith('set_enable_') and 'media' in attr.lower():
-                try:
-                    getattr(settings, attr)(True)
-                except (AttributeError, TypeError) as e:
-                    if self.debug_mode:
-                        print(f"Warning: Could not enable {attr}: {str(e)}")
-        settings.set_enable_webgl(True)
-        settings.set_enable_webaudio(True)
         try:
-            if hasattr(settings, 'set_hardware_acceleration_policy'):
-                if hasattr(WebKit.HardwareAccelerationPolicy, 'ON'):
-                    settings.set_hardware_acceleration_policy(WebKit.HardwareAccelerationPolicy.ON)
-                elif hasattr(WebKit.HardwareAccelerationPolicy, 'ALWAYS'):
-                    settings.set_hardware_acceleration_policy(WebKit.HardwareAccelerationPolicy.ALWAYS)
-            if hasattr(settings, 'set_enable_hardware_accelerated_video_decode'):
-                settings.set_enable_hardware_accelerated_video_decode(True)
-            if hasattr(settings, 'set_enable_webrtc_hardware_acceleration'):
-                settings.set_enable_webrtc_hardware_acceleration(True)
-            if hasattr(settings, 'set_enable_webgl2'):
-                settings.set_enable_webgl2(True)
-            if hasattr(settings, 'set_enable_media_cache'):
-                settings.set_enable_media_cache(True)
-            if hasattr(settings, 'set_enable_mediasource'):
+            settings = webview.get_settings()
+            self.webview = webview
+            self.last_video_url = None
+            settings.set_enable_write_console_messages_to_stdout(False)
+
+            def on_console_message(webview, console_message):
+                message = console_message.get_text()
+                if any(msg in message for msg in [
+                    'Unknown logging channel:',
+                    'The resource was preloaded using link preload',
+                    'was preloaded using link preload'
+                ]):
+                    return True
+                return False
+            os.environ['WEBKIT_DISABLE_COMPOSITING_MODE'] = '1'
+            core_settings = {
+                "enable-javascript": True,
+                "enable-javascript-markup": True,
+                "enable-html5-local-storage": True,
+                "enable-page-cache": True,
+                "media-playback-allows-inline": True,
+                "media-playback-requires-user-gesture": False,
+                "auto-load-images": True,
+                "enable-caret-browsing": False,
+                "enable-webaudio": True,
+                "enable-webgl": True,
+                "enable-mediasource": True,
+                "enable-encrypted-media": True,
+                "enable-media-stream": True,
+                "enable-webrtc": True,
+                "enable-developer-extras": True,
+                "enable-site-specific-quirks": True,
+                "enable-write-console-messages-to-stdout": False,
+            }
+            for key, value in core_settings.items():
+                try:
+                    if hasattr(settings, f"set_{key.replace('-', '_')}"):
+                        getattr(settings, f"set_{key.replace('-', '_')}")(value)
+                    else:
+                        settings.set_property(key, value)
+                except Exception:
+                    pass
+            try:
+                if hasattr(settings, 'set_hardware_acceleration_policy'):
+                    policy = getattr(WebKit, 'HardwareAccelerationPolicy', None)
+                    if policy:
+                        settings.set_hardware_acceleration_policy(policy.ALWAYS)
+            except Exception:
+                pass
+            try:
+                context = webview.get_context()
+                if hasattr(context, 'get_website_data_manager'):
+                    manager = context.get_website_data_manager()
+                    if hasattr(manager, 'set_cache_model'):
+                        manager.set_cache_model(WebKit.CacheModel.DOCUMENT_BROWSER)
+            except Exception:
+                pass
+            self._init_gstreamer()
+            try:
+                if hasattr(settings, 'set_enable_webrtc_hardware_acceleration'):
+                    settings.set_enable_webrtc_hardware_acceleration(True)
+            except Exception:
+                pass
+            try:
                 settings.set_enable_mediasource(True)
-            if hasattr(settings, 'set_enable_webaudio'):
-                settings.set_enable_webaudio(True)
-        except Exception as e:
-            print(f"Warning: Could not enable hardware acceleration: {str(e)}")
-        settings.set_allow_file_access_from_file_urls(False)
-        settings.set_allow_universal_access_from_file_urls(False)
-        settings.set_allow_modal_dialogs(False)
-        settings.set_javascript_can_access_clipboard(False)
-        settings.set_javascript_can_open_windows_automatically(False)
-        settings.set_media_playback_requires_user_gesture(False)
-        if hasattr(settings, 'set_auto_play_policy'):
-            settings.set_auto_play_policy(WebKit.AutoPlayPolicy.ALLOW)
-        webview.set_settings(settings)
-        content_manager = webview.get_user_content_manager()
-        content_manager.remove_all_scripts()
-        csp_policy = (
-            "default-src 'self' https: http: data: blob: 'unsafe-inline' 'unsafe-eval' 'unsafe-hashes'; "
-            "media-src * data: blob: https: http:; "
-            "img-src * data: blob: https: http:; "
-            "connect-src * 'self' data: blob: https: http: wss: ws:; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https: http: data: blob:; "
-            "style-src 'self' 'unsafe-inline' https: http:; "
-            "frame-src * data: blob: https: http:; "
-            "child-src * data: blob: https: http:; "
-            "worker-src 'self' blob: data: https: http:; "
-            "object-src 'none'; "
-            "base-uri 'self'; "
-            "form-action 'self' https: http:; "
-            "frame-ancestors 'self'"
-        )
-        
-        def inject_csp_headers(webview, load_event, user_data=None):
-            if load_event == WebKit.LoadEvent.STARTED:
-                try:
-                    uri = webview.get_uri()
-                    if not uri or uri.startswith(('data:', 'about:')):
-                        return
-                    csp_meta_script = """
-                    (function() {
-                        try {
-                            var existingMeta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
-                            if (existingMeta) {
-                                existingMeta.parentNode.removeChild(existingMeta);
-                            }
-                            var meta = document.createElement('meta');
-                            meta.httpEquiv = 'Content-Security-Policy';
-                            meta.content = '%%s';
-                            if (document.head) {
-                                document.head.insertBefore(meta, document.head.firstChild);
-                            } else {
-                                var head = document.createElement('head');
-                                head.appendChild(meta);
-                                document.documentElement.insertBefore(head, document.documentElement.firstChild);
-                            }
-                            document.cookie = 'csp_meta=' + encodeURIComponent(meta.content) + '; path=/; max-age=60';
-                            console.log('[CSP] Content Security Policy applied');
-                        } catch (e) {
-                            console.error('Error applying CSP:', e);
+                settings.set_enable_media_capabilities(True)
+                settings.set_enable_media_stream(True)
+            except Exception:
+                pass
+            try:
+                context = webview.get_context()
+                if context:
+                    if hasattr(context, "set_process_model"):
+                        context.set_process_model(WebKit.ProcessModel.MULTIPLE_SECONDARY_PROCESSES)
+                    if hasattr(context, "set_media_playback_requires_user_gesture"):
+                        context.set_media_playback_requires_user_gesture(False)
+                    if hasattr(settings, "set_auto_play_policy"):
+                        settings.set_auto_play_policy(WebKit.AutoPlayPolicy.ALLOW)
+                    if hasattr(context, "set_webrtc_ice_transport_policy"):
+                        context.set_webrtc_ice_transport_policy(WebKit.WebRTCIceTransportPolicy.ALL)
+                    if hasattr(context, "set_cache_model"):
+                        context.set_cache_model(WebKit.CacheModel.DOCUMENT_BROWSER)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return webview
+
+    def on_resource_load_started(self, webview, resource, request):
+        headers = request.get_http_headers()
+        if not headers:
+            try:
+                headers = Soup.MessageHeaders.new(Soup.MessageHeadersType.REQUEST)
+            except (AttributeError, TypeError):
+                headers = Soup.MessageHeaders(Soup.MemoryUse.COPY)
+        headers.replace('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8')
+        headers.replace('Accept-Language', 'en-US,en;q=0.5')
+        headers.replace('Accept-Encoding', 'gzip, deflate, br')
+        headers.replace('DNT', '1')
+        headers.replace('Connection', 'keep-alive')
+        headers.replace('Upgrade-Insecure-Requests', '1')
+        headers.replace('Sec-Fetch-Dest', 'document')
+        headers.replace('Sec-Fetch-Mode', 'navigate')
+        headers.replace('Sec-Fetch-Site', 'none')
+        headers.replace('Sec-Fetch-User', '?1')
+        return None
+
+    def register_error_handlers(self):
+        self.error_handlers = {}
+        if hasattr(self, 'webview') and hasattr(self.webview, 'connect'):
+            self.webview.connect('load-failed', self.on_load_failed)
+        self.error_handlers["gtk_warning"] = self.handle_gtk_warning
+        self.error_handlers["network_error"] = self.handle_network_error
+        self.error_handlers["webview_error"] = self.handle_webview_error
+        self.error_handlers["memory_error"] = self.handle_memory_error
+
+    def on_load_failed(self, webview, load_event, failing_uri, error):
+        error_message = self.error_handlers.get(error.code, f"Unknown error: {error.message}")
+        error_html = f"""
+        <html>
+        <head><title>Error loading page</title></head>
+        <body style="font-family: sans-serif; padding: 20px;">
+            <h2>Error loading page</h2>
+            <p>Could not load the page: <strong>{failing_uri}</strong></p>
+            <p><em>{error_message}</em></p>
+            <p><a href="{failing_uri}">Try again</a> or <a href="about:blank">go to home page</a></p>
+        </body>
+        </html>
+        """
+        webview.load_alternate_html(error_html, failing_uri, None)
+        return True
+
+    def inject_csp_headers(self, webview, load_event, user_data=None):
+        if load_event == WebKit.LoadEvent.STARTED:
+            try:
+                uri = webview.get_uri()
+                if not uri or uri.startswith(('data:', 'about:')):
+                    return
+                csp_meta_script = """
+                (function() {
+                    try {
+                        var existingMeta = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+                        if (existingMeta) {
+                            existingMeta.parentNode.removeChild(existingMeta);
                         }
-                    })();
-                    """ % csp_policy.replace('"', '\\"')
-                    manager = webview.get_user_content_manager()
-                    manager.remove_all_scripts()
-                    script = WebKit.UserScript.new(
-                        csp_meta_script,
-                        WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                        WebKit.UserScriptInjectionTime.START,
-                        None,
-                        None
-                    )
-                    manager.add_script(script)    
-                except Exception as e:
-                    if self.debug_mode:
-                        print(f"Error injecting CSP headers: {str(e)}")        
-        webview.connect("load-changed", self.inject_security_headers)
-        webview.connect("load-changed", inject_csp_headers)
-        webview.connect("decide-policy", self.block_social_trackers)        
-        webview.connect('load-changed', inject_csp_headers)
+                        var meta = document.createElement('meta');
+                        meta.httpEquiv = 'Content-Security-Policy';
+                        meta.content = '%%s';
+                        if (document.head) {
+                            document.head.insertBefore(meta, document.head.firstChild);
+                        } else {
+                            var head = document.createElement('head');
+                            head.appendChild(meta);
+                            document.documentElement.insertBefore(head, document.documentElement.firstChild);
+                        }
+                        document.cookie = 'csp_meta=' + encodeURIComponent(meta.content) + '; path=/; max-age=60';
+                        console.log('[CSP] Content Security Policy applied');
+                    } catch (e) {
+                        console.error('Error applying CSP:', e);
+                    }
+                })();
+                """
+                csp_policy = """
+                    default-src https: http: data: blob:;
+                    script-src 'unsafe-inline' 'unsafe-eval' https: http: data: blob: *;
+                    style-src 'unsafe-inline' https: http: data: *;
+                    img-src data: https: http: blob: *;
+                    font-src data: https: http: *;
+                    connect-src https: http: wss: ws: * theanimecommunity.com *.theanimecommunity.com justanime.vercel.app *.justanime.vercel.app animixplay.st *.animixplay.st;
+                    media-src https: http: blob: data: *;
+                    object-src 'none';
+                    frame-ancestors 'none';
+                    base-uri 'self';
+                    form-action https: http: *;
+                    frame-src https: http: *;
+                    worker-src blob: https: http: *;
+                    child-src blob: https: http: *;
+                """.replace('\n', ' ').strip()
+                csp_meta_script = csp_meta_script % csp_policy.replace('"', '\\"')
+                manager = webview.get_user_content_manager()
+
+                def inject_csp_delayed():
+                    try:
+                        script = WebKit.UserScript.new(
+                            csp_meta_script,
+                            WebKit.UserContentInjectedFrames.TOP_FRAME,
+                            WebKit.UserScriptInjectionTime.START,
+                            None,
+                            None
+                        )
+                        manager.add_script(script)
+                    except Exception:
+                        pass
+                GLib.timeout_add(3000, inject_csp_delayed)
+                self.content_manager = manager
+            except Exception:
+                pass
+            webview.connect("load-changed", self.inject_security_headers)
+            webview.connect("load-changed", self.inject_csp_headers)
+            webview.connect("decide-policy", self.block_social_trackers)
         try:
-            content_manager.register_script_message_handler("consoleMessage")
-            content_manager.connect(
-                "script-message-received::consoleMessage", self.on_console_message_received
-            )
+            if hasattr(self, 'content_manager') and self.content_manager:
+                self.content_manager.register_script_message_handler("consoleMessage")
+                self.content_manager.connect(
+                    "script-message-received::consoleMessage", self.on_webview_console_message
+                )
         except Exception:
             pass
         js_console_override = """
@@ -2023,11 +2287,18 @@ class ShadowBrowser(Gtk.Application):
             levels.forEach(function(level) {
                 const original = console[level];
                 console[level] = function() {
-                    sendMessage(level, arguments);
-                    if (original.apply) {
-                        original.apply(console, arguments);
-                    } else {
-                        original(arguments);
+                    try {
+                        sendMessage(level, arguments);
+                    } catch (e) {
+                        // Fail silently if message sending fails
+                    }
+                    // Always call original function safely
+                    try {
+                        if (typeof original === 'function') {
+                            return original.apply(console, arguments);
+                        }
+                    } catch (e) {
+                        // Fail silently
                     }
                 };
             });
@@ -2038,11 +2309,11 @@ class ShadowBrowser(Gtk.Application):
             WebKit.UserContentInjectedFrames.ALL_FRAMES,
             WebKit.UserScriptInjectionTime.START,
         )
-        content_manager.add_script(script)
+        if hasattr(self, 'content_manager') and self.content_manager:
+            self.content_manager.add_script(script)
         return webview
 
     def inject_mouse_event_script(self):
-        """Injects JavaScript to capture mouse events in webviews."""
         script = WebKit.UserScript.new(
             """
             (function() {
@@ -2053,12 +2324,11 @@ class ShadowBrowser(Gtk.Application):
                 function handleClick(e) {
                     // Debug the click event
                     console.log('[DEBUG] Click event detected on:', e.target);
-                    
                     // Check if this is a left mouse button click
                     if (e.button !== 0) {
                         logDebug('Not a left-click, ignoring');
                         return;
-                    }                   
+                    }
                     // Handle both link clicks and elements with click handlers
                     let target = e.target;
                     logDebug('Click target:', target);
@@ -2075,11 +2345,11 @@ class ShadowBrowser(Gtk.Application):
                         logDebug('Found clickable element:', link);
                         const href = link.getAttribute('href') || '';
                         const hasOnClick = link.hasAttribute('onclick') || link.onclick;
-                        const isVoidLink = href.trim().toLowerCase() === 'javascript:void(0)' || 
-                                         href.trim() === '#' || 
+                        const isVoidLink = href.trim().toLowerCase() === 'javascript:void(0)' ||
+                                         href.trim() === '#' ||
                                          hasOnClick ||
-                                         window.getComputedStyle(link).cursor === 'pointer';                       
-                        logDebug(`Link details - href: ${href}, hasOnClick: ${hasOnClick}, isVoidLink: ${isVoidLink}`);                        
+                                         window.getComputedStyle(link).cursor === 'pointer';
+                        logDebug(`Link details - href: ${href}, hasOnClick: ${hasOnClick}, isVoidLink: ${isVoidLink}`);
                         if (isVoidLink) {
                             // Prevent default only if we're handling it
                             if (link.getAttribute('data-handled') === 'true') {
@@ -2089,33 +2359,70 @@ class ShadowBrowser(Gtk.Application):
                                 return false;
                             }
                             // Check for data-url or try to find a URL in the element
-                            let dataUrl = link.getAttribute('data-url') || 
-                                       link.getAttribute('data-href') || 
+                            let dataUrl = link.getAttribute('data-url') ||
+                                       link.getAttribute('data-href') ||
                                        link.getAttribute('data-link') ||
                                        link.href;
+                            // Try to extract URL from onclick attribute
+                            if (!dataUrl || dataUrl === 'javascript:void(0)' || dataUrl === '#') {
+                                const onclick = link.getAttribute('onclick');
+                                if (onclick) {
+                                    logDebug('Parsing onclick attribute:', onclick);
+                                    // Try to extract URL from window.open() calls
+                                    // Handles: window.open('url'), window.open("url"), window.open(variable)
+                                    let windowOpenMatch = onclick.match(/window\\.open\\s*\\(\\s*['"]([^'"]+)['"](?:,[^)]*)?\\)/);
+                                    if (windowOpenMatch) {
+                                        dataUrl = windowOpenMatch[1];
+                                        logDebug('Extracted URL from window.open():', dataUrl);
+                                    } else {
+                                        // Try to extract function calls that might return URLs
+                                        // Handles: window.open(dbneg('id')), window.open(someFunction('arg'))
+                                        const funcMatch = onclick.match(/window\\.open\\s*\\(\\s*(\\w+)\\s*\\(\\s*['"]([^'"]+)['"](?:,[^)]*)?\\)\\s*(?:,[^)]*)?\\)/);
+                                        if (funcMatch) {
+                                            const funcName = funcMatch[1];
+                                            const funcArg = funcMatch[2];
+                                            logDebug(`Found function call: ${funcName}('${funcArg}')`);
+                                            // Try to call the function if it exists in window scope
+                                            try {
+                                                if (typeof window[funcName] === 'function') {
+                                                    const result = window[funcName](funcArg);
+                                                    if (result && typeof result === 'string' &&
+                                                        (result.startsWith('http') || result.startsWith('/') || result.startsWith('www'))) {
+                                                        dataUrl = result;
+                                                        logDebug(`Executed ${funcName}('${funcArg}') = ${dataUrl}`);
+                                                    }
+                                                }
+                                            } catch (err) {
+                                                logDebug(`Error executing ${funcName}:`, err);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // If still no URL, check child elements
-                            if (!dataUrl) {
+                            if (!dataUrl || dataUrl === 'javascript:void(0)' || dataUrl === '#') {
                                 const possibleElements = link.querySelectorAll('[href], [data-href], [data-link], [data-src], [data-url]');
                                 for (const el of possibleElements) {
-                                    const val = el.href || el.getAttribute('href') || 
-                                              el.getAttribute('data-href') || el.getAttribute('data-link') || 
+                                    const val = el.href || el.getAttribute('href') ||
+                                              el.getAttribute('data-href') || el.getAttribute('data-link') ||
                                               el.getAttribute('data-src') || el.getAttribute('data-url');
                                     if (val && (val.startsWith('http') || val.startsWith('/'))) {
                                         dataUrl = val;
                                         break;
                                     }
                                 }
-                            }                            
-                            logDebug('Extracted URL:', dataUrl);               
-                            if (dataUrl) {
+                            }
+                            logDebug('Extracted URL:', dataUrl);
+                            if (dataUrl && dataUrl !== 'javascript:void(0)' && dataUrl !== '#') {
                                 // Mark as handled to prevent duplicate processing
-                                link.setAttribute('data-handled', 'true');                                
+                                link.setAttribute('data-handled', 'true');
                                 // Prepare the message
                                 const message = {
                                     url: dataUrl,
                                     href: link.href || '',
                                     text: (link.innerText || link.textContent || '').trim(),
                                     hasOnClick: hasOnClick,
+                                    onclick: link.getAttribute('onclick') || '',
                                     tagName: link.tagName,
                                     className: link.className || '',
                                     id: link.id || ''
@@ -2125,7 +2432,7 @@ class ShadowBrowser(Gtk.Application):
                                 try {
                                     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.voidLinkClicked) {
                                         window.webkit.messageHandlers.voidLinkClicked.postMessage(message);
-                                        logDebug('Message sent successfully');                                       
+                                        logDebug('Message sent successfully');
                                         // Prevent default if we're handling the click
                                         e.preventDefault();
                                         e.stopPropagation();
@@ -2152,17 +2459,17 @@ class ShadowBrowser(Gtk.Application):
                     if (e.button === 0) {
                         handleClick(e);
                     }
-                }, {capture: true, passive: false});              
+                }, {capture: true, passive: false});
                 // Handle dynamically added content
                 const observer = new MutationObserver(function(mutations) {
                     logDebug('DOM mutation detected, reinjecting event listeners');
                     document.removeEventListener('click', handleClick, {capture: true, passive: false});
                     document.addEventListener('click', handleClick, {capture: true, passive: false});
-                });               
+                });
                 observer.observe(document.body, {
                     childList: true,
                     subtree: true
-                });               
+                });
                 logDebug('Mouse event handler injected successfully');
             })();
             """,
@@ -2182,68 +2489,158 @@ class ShadowBrowser(Gtk.Application):
             WebKit.UserScriptInjectionTime.END,
             [],
             []
-        )        
+        )
         self.content_manager.add_script(script)
         self.content_manager.add_script(end_script)
 
-    def create_toolbar(self):
-        if hasattr(self, "toolbar") and self.toolbar is not None:
-            if self.toolbar.get_parent() is not None:
-                return self.toolbar
-            else:
-                self.toolbar = None
-        self.toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.toolbar.set_margin_start(6)
-        self.toolbar.set_margin_end(6)
-        self.toolbar.set_margin_top(6)
-        self.toolbar.set_margin_bottom(6)
+    def _create_icon_button(self, icon_name, callback, tooltip_text=None):
+        image = Gtk.Image.new_from_icon_name(icon_name)
+        button = Gtk.Button()
+        button.set_child(image)
+        button.set_has_frame(False)
+        button.set_margin_start(2)
+        button.set_margin_end(2)
+        if tooltip_text:
+            button.set_tooltip_text(tooltip_text)
+        button.connect("clicked", callback)
+        return button
 
-        def icon_button(icon_name, callback):
-            image = Gtk.Image.new_from_icon_name(icon_name)
-            button = Gtk.Button()
-            button.set_child(image)
-            button.connect("clicked", callback)
-            return button
-        self.toolbar.append(icon_button("go-previous-symbolic", self.on_back_clicked))
-        self.toolbar.append(icon_button("go-next-symbolic", self.on_forward_clicked))
-        self.toolbar.append(icon_button("view-refresh-symbolic", self.on_refresh_clicked))
-        self.toolbar.append(icon_button("go-home-symbolic", lambda b: self.load_url(self.home_url)))
-        self.url_entry = Gtk.Entry(placeholder_text="Enter URL")
+    def on_zoom_in_clicked(self, button):
+        self.zoom_in()
+
+    def on_zoom_out_clicked(self, button):
+        self.zoom_out()
+
+    def on_zoom_reset_clicked(self, button):
+        self.zoom_reset()
+
+    def on_tor_status_clicked(self, button):
+        self.toggle_tor(not self.tor_enabled)
+        self.update_tor_status_indicator()
+
+    def create_toolbar(self):
+        if getattr(self, "toolbar", None) and self.toolbar.get_parent():
+            return self.toolbar
+        self.toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.toolbar.set_margin_start(4)
+        self.toolbar.set_margin_end(4)
+        self.toolbar.set_margin_top(2)
+        self.toolbar.set_margin_bottom(2)
+        self.toolbar.add_css_class("toolbar")
+        try:
+            self.toolbar.set_hexpand(True)
+        except Exception:
+            pass
+        nav_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        nav_box.add_css_class("linked")
+        nav_box.append(self._create_icon_button("go-previous-symbolic",
+                                             self.on_back_clicked,
+                                             "Back"))
+        nav_box.append(self._create_icon_button("go-next-symbolic",
+                                             self.on_forward_clicked,
+                                             "Forward"))
+        nav_box.append(self._create_icon_button("view-refresh-symbolic",
+                                             self.on_refresh_clicked,
+                                             "Reload"))
+        nav_box.append(self._create_icon_button("go-home-symbolic",
+                                             lambda b: self.load_url(self.home_url),
+                                             "Home"))
+        self.toolbar.append(nav_box)
+        url_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        url_box.add_css_class("linked")
+        self.url_entry = Gtk.Entry(placeholder_text="Enter URL or search terms")
+        self.url_entry.set_hexpand(True)
         self.url_entry.connect("activate", self.on_go_clicked)
-        self.toolbar.append(self.url_entry)
-        self.toolbar.append(icon_button("go-jump-symbolic", self.on_go_clicked))
-        self.toolbar.append(icon_button("bookmark-new-symbolic", self.on_add_bookmark_clicked))
-        self.toolbar.append(icon_button("tab-new-symbolic", self.on_new_tab_clicked))
+        url_box.append(self.url_entry)
+        go_button = Gtk.Button(label="Go")
+        go_button.connect("clicked", self.on_go_clicked)
+        url_box.append(go_button)
+        self.toolbar.append(url_box)
+        action_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        action_box.add_css_class("linked")
+        action_box.append(self._create_icon_button("bookmark-new-symbolic",
+                                                self.on_add_bookmark_clicked,
+                                                "Add Bookmark"))
+        action_box.append(self._create_icon_button("tab-new-symbolic",
+                                                self.on_new_tab_clicked,
+                                                "New Tab"))
+        action_box.append(self._create_icon_button("camera-photo-symbolic",
+                                                self.on_screenshot_clicked,
+                                                "Take Screenshot"))
+        zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        zoom_box.add_css_class("linked")
+        zoom_box.append(self._create_icon_button("zoom-out-symbolic",
+                                              self.on_zoom_out_clicked,
+                                              "Zoom Out"))
+        zoom_box.append(self._create_icon_button("zoom-fit-best-symbolic",
+                                              self.on_zoom_reset_clicked,
+                                              "Reset Zoom"))
+        zoom_box.append(self._create_icon_button("zoom-in-symbolic",
+                                              self.on_zoom_in_clicked,
+                                              "Zoom In"))
+        self.toolbar.append(action_box)
+        self.toolbar.append(zoom_box)
+        try:
+            dev_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            dev_box.add_css_class("linked")
+            inspect_button = Gtk.Button(label="Inspect")
+            inspect_button.set_tooltip_text("Open Web Inspector")
+            inspect_button.connect("clicked", self.on_inspect_clicked)
+            dev_box.append(inspect_button)
+            self.toolbar.append(dev_box)
+        except Exception:
+            pass
         if hasattr(self, 'download_spinner') and self.download_spinner:
             self.download_spinner.set_halign(Gtk.Align.END)
             self.download_spinner.set_valign(Gtk.Align.CENTER)
-            self.download_spinner.set_margin_start(10)
-            self.download_spinner.set_margin_end(10)
+            self.download_spinner.set_margin_start(6)
+            self.download_spinner.set_margin_end(6)
             self.download_spinner.set_visible(False)
             self.toolbar.append(self.download_spinner)
-        try:
-            self.tor_status_button = icon_button("network-transmit-receive-symbolic", self.on_tor_status_clicked)
-            self.tor_status_button.set_tooltip_text("Tor is disabled")
-            self.tor_status_button.set_opacity(0.5)
-            self.tor_status_button.set_margin_start(10)
-            self.tor_status_button.set_margin_end(10)
-            self.tor_status_button.set_margin_top(5)
-            self.tor_status_button.set_margin_bottom(5)
-            self.toolbar.append(self.tor_status_button)
-            self.update_tor_status_indicator()
-        except Exception:
-            pass
         return self.toolbar
 
+    def on_inspect_clicked(self, button=None):
+        webview = self.get_current_webview() or getattr(self, 'webview', None)
+        if not webview:
+            return
+        settings = getattr(webview, 'get_settings', lambda: None)()
+        dev_enabled = False
+        if settings:
+            try:
+                dev_enabled = bool(
+                    getattr(settings, 'get_enable_developer_extras', lambda: None)()
+                )
+            except Exception:
+                try:
+                    dev_enabled = bool(settings.get_property('enable-developer-extras'))
+                except Exception:
+                    pass
+            if not dev_enabled:
+                try:
+                    if hasattr(settings, 'set_enable_developer_extras'):
+                        settings.set_enable_developer_extras(True)
+                    else:
+                        settings.set_property('enable-developer-extras', True)
+                except Exception:
+                    pass
+        inspector = getattr(webview, 'get_inspector', lambda: None)()
+        if inspector and hasattr(inspector, 'show'):
+            inspector.show()
+        elif hasattr(webview, 'run_javascript'):
+            js = "console.log('[Inspector] Requested via toolbar'); debugger;"
+            try:
+                webview.run_javascript(js, None, None, None)
+            except Exception:
+                pass
+
     def safe_show_popover(self, popover):
-        """Safely show a Gtk.Popover, avoiding multiple popups or broken state."""
         if not popover:
             return
         try:
             if not popover.get_child():
-                return               
+                return
             if popover.get_visible():
-                return               
+                return
             child = popover.get_child()
             if (
                 child
@@ -2256,16 +2653,15 @@ class ShadowBrowser(Gtk.Application):
                         if parent and hasattr(parent, "remove") and child.get_parent() == parent:
                             parent.remove(child)
                 except Exception:
-                    pass                   
+                    pass
             parent = popover.get_parent()
             if parent is None:
-                pass                 
+                pass
             popover.popup()
         except Exception:
             pass
 
     def _show_bookmarks_menu(self, button=None):
-        """Show the bookmarks menu."""
         if hasattr(self, "toolbar") and self.toolbar is not None:
             child = self.toolbar.get_first_child()
             while child:
@@ -2276,109 +2672,174 @@ class ShadowBrowser(Gtk.Application):
                     popover = child.get_popover()
                     if popover:
                         self.safe_show_popover(popover)
-                        return
+                        break
                 child = child.get_next_sibling()
 
     def update_bookmarks_menu(self, menu_container):
-        """Update the bookmarks menu UI with current bookmarks."""
+        if not menu_container:
+            return
         try:
-            if not menu_container:
-                return                
-            try:
+            while True:
                 child = menu_container.get_first_child()
-                while child:
-                    next_child = child.get_next_sibling()
-                    try:
-                        if hasattr(child, 'get_parent') and child.get_parent() is not None:
-                            parent = child.get_parent()
-                            if parent and hasattr(parent, "remove") and child.get_parent() == parent:
-                                parent.remove(child)
-                    except Exception:
-                        pass
-                    child = next_child
-            except Exception:
-                pass                
-            for bookmark_url in self.bookmarks:
-                try:
-                    hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-                    hbox.set_halign(Gtk.Align.FILL)
-                    hbox.set_hexpand(True)                   
-                    display_text = bookmark_url[:30] + "..." if len(bookmark_url) > 30 else bookmark_url                    
-                    button = Gtk.Button(label=display_text)
-                    button.set_halign(Gtk.Align.START)
-                    button.set_hexpand(True)
-                    button.set_tooltip_text(bookmark_url)
-                    button.connect("clicked", lambda btn, url=bookmark_url: self.load_url(url))                    
-                    delete_button = Gtk.Button()
-                    delete_button.set_icon_name("edit-delete-symbolic")
-                    delete_button.set_tooltip_text("Delete bookmark")
-                    delete_button.add_css_class("destructive-action")                    
-                    delete_button.connect("clicked", self._on_delete_bookmark_clicked, bookmark_url)                   
-                    hbox.append(button)
-                    hbox.append(delete_button)                    
-                    menu_container.append(hbox)
-                except Exception:
-                    pass                    
-            try:
-                separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-                menu_container.append(separator)
-            except Exception:
-                pass               
-            try:
-                clear_button = Gtk.Button(label="Clear All Bookmarks")
-                clear_button.set_halign(Gtk.Align.CENTER)
-                clear_button.connect("clicked", self._clear_all_bookmarks)
-                menu_container.append(clear_button)
-            except Exception:
-                pass
+                if not child:
+                    break
+                menu_container.remove(child)
         except Exception:
             pass
+        if menu_container == self.bookmark_menu:
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_property("height-request", 700)
+            scrolled.set_property("width-request", 300)
+            bookmarks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            bookmarks_box.set_margin_top(6)
+            bookmarks_box.set_margin_bottom(6)
+            bookmarks_box.set_margin_start(6)
+            bookmarks_box.set_margin_end(6)
+            scrolled.set_child(bookmarks_box)
+            menu_container.append(scrolled)
+            menu_container = bookmarks_box
+        if not hasattr(self, 'bookmarks') or not self.bookmarks:
+            empty_label = Gtk.Label(label="No bookmarks yet")
+            empty_label.set_margin_top(12)
+            empty_label.set_margin_bottom(12)
+            menu_container.append(empty_label)
+        else:
+            for bookmark in self.bookmarks:
+                if isinstance(bookmark, str):
+                    bookmark = {"url": bookmark, "title": None, "favicon": None}
+                url = bookmark.get("url")
+                if not url:
+                    continue
+                title = bookmark.get("title") or url
+                display_text = (title[:30] + "...") if len(title) > 30 else title
+                menu_item = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                menu_item.set_hexpand(True)
+                menu_item.set_halign(Gtk.Align.FILL)
+                menu_item.set_margin_start(6)
+                menu_item.set_margin_end(6)
+                bookmark_btn = Gtk.Button()
+                bookmark_btn.set_hexpand(True)
+                bookmark_btn.set_halign(Gtk.Align.FILL)
+                bookmark_btn.set_has_frame(False)
+                bookmark_btn.set_can_focus(False)
+                content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                content_box.set_hexpand(True)
+                favicon = bookmark.get("favicon")
+                favicon_img = Gtk.Image.new_from_icon_name("bookmark-new-symbolic")
+                if favicon:
+                    try:
+                        if isinstance(favicon, str) and favicon.startswith("data:image/"):
+                            encoded = favicon.split(",", 1)[1]
+                        else:
+                            encoded = favicon
+                        if isinstance(encoded, str):
+                            padding = len(encoded) % 4
+                            if padding:
+                                encoded += "=" * (4 - padding)
+                            try:
+                                image_data = base64.b64decode(encoded)
+                                bytes_data = GLib.Bytes.new(image_data)
+                                stream = Gio.MemoryInputStream.new_from_bytes(bytes_data)
+                                try:
+                                    pixbuf = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
+                                    if pixbuf:
+                                        if pixbuf.get_width() != 16 or pixbuf.get_height() != 16:
+                                            pixbuf = pixbuf.scale_simple(16, 16, GdkPixbuf.InterpType.BILINEAR)
+                                        width = pixbuf.get_width()
+                                        height = pixbuf.get_height()
+                                        has_alpha = pixbuf.get_has_alpha()
+                                        rowstride = pixbuf.get_rowstride()
+                                        pixels = pixbuf.get_pixels()
+                                        fmt = Gdk.MemoryFormat.R8G8B8A8_PREMULTIPLIED if has_alpha else Gdk.MemoryFormat.R8G8B8X8
+                                        texture = Gdk.MemoryTexture.new(
+                                            width,
+                                            height,
+                                            fmt,
+                                            GLib.Bytes.new(pixels),
+                                            rowstride
+                                        )
+                                        favicon_img = Gtk.Picture.new_for_paintable(texture)
+                                        favicon_img.set_size_request(16, 16)
+                                except Exception:
+                                    pass
+                                finally:
+                                    stream.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                favicon_img.set_margin_end(6)
+                content_box.append(favicon_img)
+                label = Gtk.Label(label=display_text)
+                label.set_halign(Gtk.Align.START)
+                label.set_ellipsize(3)
+                content_box.append(label)
+                bookmark_btn.set_child(content_box)
+                bookmark_btn.set_tooltip_text(url)
+                bookmark_btn.connect("clicked", lambda _, u=url: self.load_url(u))
+                delete_btn = Gtk.Button()
+                delete_btn.set_icon_name("edit-delete-symbolic")
+                delete_btn.add_css_class("flat")
+                delete_btn.set_tooltip_text("Delete bookmark")
+                delete_btn.connect("clicked", self._on_delete_bookmark_clicked, url)
+                menu_item.append(bookmark_btn)
+                menu_item.append(delete_btn)
+                menu_container.append(menu_item)
+        if hasattr(self, 'bookmarks') and self.bookmarks:
+            separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            separator.set_margin_top(6)
+            separator.set_margin_bottom(6)
+            menu_container.append(separator)
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            btn_box.set_halign(Gtk.Align.CENTER)
+            clear_btn = Gtk.Button(label="Clear All Bookmarks")
+            clear_btn.set_halign(Gtk.Align.CENTER)
+            clear_btn.connect("clicked", self._clear_all_bookmarks)
+            btn_box.append(clear_btn)
+            menu_container.append(btn_box)
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
 
     def do_activate(self):
-        """Create and show the main window."""
-        try:
-            if not self.wake_lock_active:
-                self.wake_lock_active = self.wake_lock.inhibit()
-            if hasattr(self, "window") and self.window:
-                try:
-                    self.window.present()
-                    return
-                except Exception:
-                    self.window = None           
-            self.window = Gtk.ApplicationWindow(application=self)
-            self.window.set_title("Shadow Browser")
-            self.window.set_default_size(800, 600)           
-            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)           
-            menubar = self.create_menubar()
-            self.safe_append(vbox, menubar)           
-            toolbar = self.create_toolbar()
-            self.safe_append(vbox, toolbar)           
-            self.safe_append(vbox, self.notebook)            
-            self.download_manager.parent_window = self.window
-            self.download_manager.show()
-            self.safe_append(vbox, self.download_manager.box)           
-            if not self.window.get_child():
-                self.window.set_child(vbox)           
-            if not hasattr(self, '_window_signals_connected'):
-                self.window.connect("close-request", self.on_window_destroy)
-                self._window_signals_connected = True           
-            if len(self.tabs) == 0:
-                self.add_new_tab(self.home_url)           
-            self.window.present()
-        except Exception:
-            pass
+        if not self.wake_lock_active:
+            self.wake_lock = self.inhibit(None, Gtk.ApplicationInhibitFlags.SUSPEND, "Prevent system suspend while browser is running")
+            self.wake_lock_active = True
+        if hasattr(self, "window") and self.window:
+            try:
+                self.window.present()
+                return
+            except Exception:
+                self.window = None
+        self.window = Gtk.ApplicationWindow(application=self)
+        self.window.set_title("Shadow Browser")
+        self.window.set_default_size(1200, 800)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        menubar = self.create_menubar()
+        self.safe_append(vbox, menubar)
+        toolbar = self.create_toolbar()
+        self.safe_append(vbox, toolbar)
+        self.safe_append(vbox, self.notebook)
+        self.download_manager.parent_window = self.window
+        self.download_manager.show()
+        self.safe_append(vbox, self.download_manager.box)
+        if not self.window.get_child():
+            self.window.set_child(vbox)
+        if not hasattr(self, '_window_signals_connected'):
+            self.window.connect("close-request", self.on_window_destroy)
+            self._window_signals_connected = True
+        if len(self.tabs) == 0:
+            self.add_new_tab(self.home_url)
+        self.window.present()
 
     def do_shutdown(self):
-        """Save session and tabs before shutdown."""
         try:
-            if self.wake_lock_active:
-                self.wake_lock.uninhibit()
+            if self.wake_lock_active and hasattr(self, 'wake_lock'):
+                self.uninhibit(self.wake_lock)
                 self.wake_lock_active = False
             self.save_session()
-            self.save_tabs()           
+            self.save_tabs()
             if hasattr(self, '_popup_windows'):
                 try:
                     for popup in self._popup_windows:
@@ -2388,19 +2849,25 @@ class ShadowBrowser(Gtk.Application):
                             pass
                     self._popup_windows = []
                 except Exception:
-                    pass              
+                    pass
+            if hasattr(self, 'tor_manager') and self.tor_manager:
+                try:
+                    self.tor_manager.stop()
+                    self.tor_manager = None
+                except Exception:
+                    pass
             if hasattr(self, 'download_manager') and self.download_manager:
                 try:
                     if hasattr(self.download_manager, 'box') and self.download_manager.box:
-                        self.download_manager.clear_all()                       
+                        self.download_manager.clear_all()
                         try:
                             if hasattr(self.download_manager.box, 'get_parent') and self.download_manager.box.get_parent() is not None:
                                 parent = self.download_manager.box.get_parent()
                                 if parent and hasattr(parent, "remove") and self.download_manager.box.get_parent() == parent:
                                     parent.remove(self.download_manager.box)
                         except Exception:
-                            pass                      
-                        self.download_manager.box = None                        
+                            pass
+                        self.download_manager.box = None
                     if hasattr(self.download_manager, 'download_area') and self.download_manager.download_area:
                         try:
                             if hasattr(self.download_manager.download_area, 'get_parent') and self.download_manager.download_area.get_parent() is not None:
@@ -2409,26 +2876,20 @@ class ShadowBrowser(Gtk.Application):
                                     parent.remove(self.download_manager.download_area)
                         except Exception:
                             pass
-                        self.download_manager.download_area = None                        
+                        self.download_manager.download_area = None
                     if hasattr(self.download_manager, 'download_spinner') and self.download_manager.download_spinner:
                         try:
                             self.download_manager.download_spinner.stop()
                             self.download_manager.download_spinner.set_visible(False)
                         except Exception:
                             pass
-                        self.download_manager.download_spinner = None                       
+                        self.download_manager.download_spinner = None
                     self.download_manager = None
                 except Exception:
                     pass
         except Exception:
             pass
         Gtk.Application.do_shutdown(self)
-
-    def register_error_handlers(self):
-        self.error_handlers["gtk_warning"] = self.handle_gtk_warning
-        self.error_handlers["network_error"] = self.handle_network_error
-        self.error_handlers["webview_error"] = self.handle_webview_error
-        self.error_handlers["memory_error"] = self.handle_memory_error
 
     def handle_gtk_warning(self, message):
         return True
@@ -2442,45 +2903,39 @@ class ShadowBrowser(Gtk.Application):
     def handle_memory_error(self, error):
         return True
 
-    def toggle_debug_mode(self, action=None, parameter=None):
-        self.debug_mode = not self.debug_mode
-        self.set_logging_level()
-
     def set_logging_level(self):
         pass
 
     def _close_bookmark_popover(self):
-        """Helper to close the bookmarks popover."""
         if hasattr(self, 'bookmark_popover') and self.bookmark_popover:
-            self.bookmark_popover.popdown()
-    
+            if self.bookmark_popover.get_visible():
+                self.bookmark_popover.popdown()
+
     def _on_key_pressed(self, controller, keyval, keycode, state):
-        """Handle keyboard shortcuts."""
-        from gi.repository import Gdk     
         ctrl = (state & Gdk.ModifierType.CONTROL_MASK)
-        shift = (state & Gdk.ModifierType.SHIFT_MASK)       
+        shift = (state & Gdk.ModifierType.SHIFT_MASK)
         if ctrl and shift and keyval == Gdk.KEY_b:
             self.test_bookmarks_menu()
             return True
         return False
-        
+
     def _on_delete_bookmark_clicked(self, button, url):
-        """Handle click on the delete bookmark button."""
-        if url in self.bookmarks:
-            self.bookmarks.remove(url)
-            self.save_json(BOOKMARKS_FILE, self.bookmarks)
-            self.update_bookmarks_menu(self.bookmark_menu)
-            self._close_bookmark_popover()
+        for i, bookmark in enumerate(self.bookmarks):
+            if isinstance(bookmark, dict) and bookmark.get('url') == url:
+                del self.bookmarks[i]
+                self.save_json(BOOKMARKS_FILE, self.bookmarks)
+                self._close_bookmark_popover()
+                self.update_bookmarks_menu(self.bookmark_menu)
+                break
 
     def _clear_all_bookmarks(self, button=None):
-        """Clear all bookmarks."""
         self.bookmarks.clear()
         self.save_json(BOOKMARKS_FILE, self.bookmarks)
-        self.update_bookmarks_menu(self.bookmark_menu)
         self._close_bookmark_popover()
-    
+        self.update_bookmarks_menu(self.bookmark_menu)
+
     def create_menubar(self):
-        menubar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)       
+        menubar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         try:
             if hasattr(self, 'bookmark_menu_button') and self.bookmark_menu_button:
                 if hasattr(self.bookmark_menu_button, 'get_parent') and self.bookmark_menu_button.get_parent() is not None:
@@ -2489,16 +2944,13 @@ class ShadowBrowser(Gtk.Application):
                         if parent and hasattr(parent, "remove") and self.bookmark_menu_button.get_parent() == parent:
                             parent.remove(self.bookmark_menu_button)
                     except Exception:
-                        pass           
-            self.bookmark_menu_button = Gtk.MenuButton(label="Bookmarks")
-            self.bookmark_menu_button.set_tooltip_text("Show bookmarks")            
-            if hasattr(self, 'bookmark_popover') and self.bookmark_popover:
-                try:
-                    self.bookmark_popover.popdown()
-                except Exception:
-                    pass                    
-            self.bookmark_popover = Gtk.Popover()
-            self.bookmark_popover.set_size_request(300, -1)  # Fixed width, auto height
+                        pass
+            if not hasattr(self, 'bookmark_menu_button') or not self.bookmark_menu_button:
+                self.bookmark_menu_button = Gtk.MenuButton(label="Bookmarks")
+            self.bookmark_menu_button.set_tooltip_text("Show bookmarks")
+            if not hasattr(self, 'bookmark_popover') or not self.bookmark_popover:
+                self.bookmark_popover = Gtk.Popover()
+            self.bookmark_popover.set_size_request(300, -1)
             if not hasattr(self, 'bookmark_menu') or self.bookmark_menu is None:
                 self.bookmark_menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             else:
@@ -2515,14 +2967,13 @@ class ShadowBrowser(Gtk.Application):
                             pass
                         child = next_child
                 except Exception:
-                    pass           
+                    pass
             self.update_bookmarks_menu(self.bookmark_menu)
             self.bookmark_popover.set_child(self.bookmark_menu)
             self.bookmark_menu_button.set_popover(self.bookmark_popover)
-            self.bookmark_popover.connect("closed", lambda popover: popover.set_visible(False))
             self.safe_append(menubar, self.bookmark_menu_button)
         except Exception:
-            pass       
+            pass
         try:
             if hasattr(self, 'window') and self.window:
                 shortcut_controller = Gtk.EventControllerKey()
@@ -2543,30 +2994,53 @@ class ShadowBrowser(Gtk.Application):
             settings_button.connect("clicked", lambda x: self.on_settings_clicked(x))
             self.safe_append(menubar, settings_button)
         except Exception:
-            pass            
+            pass
+        try:
+            self.tor_button = Gtk.Button()
+            self.tor_button.add_css_class("tor-button")
+            self.tor_button.set_tooltip_text("Toggle Tor connection")
+            self.update_tor_button()
+            self.tor_button.connect("clicked", self.on_tor_button_clicked)
+            self.safe_append(menubar, self.tor_button)
+        except Exception:
+            pass
         try:
             clear_data_button = Gtk.Button(label="Clear Data")
             clear_data_button.set_tooltip_text("Clear browsing data")
             clear_data_button.connect("clicked", lambda x: self.create_clear_data_dialog().present())
             self.safe_append(menubar, clear_data_button)
         except Exception:
-            pass            
+            pass
         try:
             about_button = Gtk.Button(label="About")
             about_button.connect("clicked", self.on_about)
             self.safe_append(menubar, about_button)
         except Exception:
-            pass            
-        try:
-            self.test_button = Gtk.Button(label="Test Message Handler")
-            self.test_button.connect("clicked", self.on_test_message_handler)
-            self.safe_append(menubar, self.test_button)
-        except Exception:
-            pass            
+            pass
         return menubar
 
+    def _on_settings_save(self, button):
+        self.adblocker.enabled = self.adblock_toggle.get_active()
+        self.incognito_mode = self.incognito_toggle.get_active()
+        self.anti_fingerprinting_enabled = self.anti_fp_toggle.get_active()
+        self.search_engine = self.search_engine_entry.get_text().strip()
+        self.home_url = self.home_page_entry.get_text().strip()
+        with self.tabs_lock:
+            for tab in self.tabs:
+                if hasattr(tab, 'webview'):
+                    GLib.idle_add(tab.webview.reload)
+        if hasattr(self, 'settings_dialog') and self.settings_dialog is not None:
+            self.settings_dialog.emit("response", Gtk.ResponseType.APPLY)
+
+    def _on_settings_dialog_response(self, dialog, response_id):
+        if response_id == Gtk.ResponseType.ACCEPT or response_id == Gtk.ResponseType.OK:
+            self._on_settings_save(None)
+        if dialog:
+            dialog.destroy()
+        if hasattr(self, 'settings_dialog') and self.settings_dialog == dialog:
+            self.settings_dialog = None
+
     def on_settings_clicked(self, button):
-        """Open the settings dialog."""
         if hasattr(self, "settings_dialog") and self.settings_dialog:
             self.settings_dialog.present()
             return
@@ -2591,11 +3065,11 @@ class ShadowBrowser(Gtk.Application):
         grid.attach(self.incognito_toggle, 0, 1, 1, 1)
         self.anti_fp_toggle = Gtk.CheckButton(label="Enable Anti-Fingerprinting")
         self.anti_fp_toggle.set_active(getattr(self, "anti_fingerprinting_enabled", True))
-        grid.attach(self.anti_fp_toggle, 0, 2, 1, 1)       
+        grid.attach(self.anti_fp_toggle, 0, 2, 1, 1)
         self.tor_toggle = Gtk.CheckButton(label="Enable Tor (Requires Tor to be installed)")
         self.tor_toggle.set_active(getattr(self, "tor_enabled", False))
         self.tor_toggle.connect("toggled", self.on_tor_toggled)
-        grid.attach(self.tor_toggle, 0, 3, 2, 1)       
+        grid.attach(self.tor_toggle, 0, 3, 2, 1)
         search_label = Gtk.Label(label="Default Search Engine URL:")
         search_label.set_halign(Gtk.Align.START)
         grid.attach(search_label, 0, 4, 1, 1)
@@ -2614,72 +3088,63 @@ class ShadowBrowser(Gtk.Application):
         button_box.append(save_button)
         button_box.append(cancel_button)
         grid.attach(button_box, 0, 6, 2, 1)
-        save_button.connect("clicked", self.on_settings_save)
-        cancel_button.connect("clicked", lambda btn: self.settings_dialog.response(Gtk.ResponseType.CANCEL))
-        self.settings_dialog.connect("response", self.on_settings_dialog_response)       
+        save_button.connect("clicked", self._on_settings_save)
+        cancel_button.connect("clicked", lambda btn: self.settings_dialog.emit("response", Gtk.ResponseType.CANCEL))
+        self.settings_dialog.connect("response", self._on_settings_dialog_response)
         self.settings_dialog.present()
 
     def on_settings_dialog_response(self, dialog, response_id):
         if response_id == Gtk.ResponseType.ACCEPT or response_id == Gtk.ResponseType.OK:
             self.on_settings_save(None)
-        if dialog and dialog.is_visible():
-            dialog.set_visible(False)
         if dialog:
             dialog.destroy()
         if hasattr(self, 'settings_dialog') and self.settings_dialog == dialog:
             self.settings_dialog = None
 
     def on_settings_save(self, button):
-        try:
-            self.adblocker.enabled = self.adblock_toggle.get_active()
-            self.incognito_mode = self.incognito_toggle.get_active()
-            self.anti_fingerprinting_enabled = self.anti_fp_toggle.get_active()
-            self.search_engine = self.search_engine_entry.get_text().strip()
-            self.home_url = self.home_page_entry.get_text().strip()      
-            with self.tabs_lock:
-                for tab in self.tabs:
-                    if hasattr(tab, 'webview') and tab.webview:
-                        GLib.idle_add(tab.webview.reload)
-        except Exception:
-            pass
-        finally:
-            pass
+        self.adblocker.enabled = self.adblock_toggle.get_active()
+        self.incognito_mode = self.incognito_toggle.get_active()
+        self.anti_fingerprinting_enabled = self.anti_fp_toggle.get_active()
+        self.search_engine = self.search_engine_entry.get_text().strip()
+        self.home_url = self.home_page_entry.get_text().strip()
+        with self.tabs_lock:
+            for tab in self.tabs:
+                if hasattr(tab, 'webview') and tab.webview:
+                    GLib.idle_add(tab.webview.reload)
 
     def toggle_tor(self, enabled):
-        """Toggle Tor on or off.
-        Args:
-            enabled (bool): Whether to enable or disable Tor
-        Returns:
-            bool: True if the operation was successful, False otherwise
-        """
         try:
+            if not hasattr(self, 'tor_manager') or not self.tor_manager:
+                self.tor_manager = TorManager()
             if enabled:
-                if not hasattr(self, 'tor_manager') or not self.tor_manager:
-                    self.tor_manager = TorManager()
-                if self.tor_manager.start():
-                    tor_proxy = f"socks5h://127.0.0.1:{self.tor_manager.tor_port}"
-                    os.environ['http_proxy'] = tor_proxy
-                    os.environ['https_proxy'] = tor_proxy
-                    os.environ['all_proxy'] = tor_proxy
-                    self.tor_enabled = True
-                    GLib.idle_add(self.update_tor_status_indicator)
-                    return True
-                else:
-                    GLib.idle_add(self.update_tor_status_indicator)
+                if not self.tor_manager.is_running() and not self.tor_manager.start():
+                    self.tor_status = "failed"
                     return False
+                self.tor_enabled = True
+                self.tor_status = "enabled"
+                return True
             else:
-                self.tor_enabled = False
                 if hasattr(self, 'tor_manager') and self.tor_manager:
-                    self.tor_manager.stop()
-                os.environ.pop('http_proxy', None)
-                os.environ.pop('https_proxy', None)
-                os.environ.pop('all_proxy', None)
-                self.home_url = "https://duckduckgo.com/"
-                GLib.idle_add(self.update_tor_status_indicator)
+                    if not self.tor_manager.stop():
+                        return False
+                for tab in self.tabs:
+                    if hasattr(tab, 'webview') and tab.webview:
+                        session = self.tor_manager._get_network_session(tab.webview)
+                        if session:
+                            try:
+                                session.set_proxy_settings(
+                                    WebKit.NetworkProxyMode.NO_PROXY,
+                                    None
+                                )
+                            except Exception:
+                                pass
+                for var in ['http_proxy', 'https_proxy', 'ftp_proxy', 'all_proxy']:
+                    os.environ.pop(var, None)
+                self.tor_enabled = False
+                self.tor_status = "disabled"
                 return True
         except Exception:
-            pass
-            GLib.idle_add(self.update_tor_status_indicator)
+            self.tor_status = "error"
             return False
 
     def on_tor_toggled(self, toggle_button):
@@ -2688,6 +3153,7 @@ class ShadowBrowser(Gtk.Application):
             with self.tabs_lock:
                 for tab in self.tabs:
                     if hasattr(tab, 'webview'):
+                        self.update_webview_tor_proxy(tab.webview)
                         GLib.idle_add(tab.webview.reload)
             if enabled:
                 GLib.timeout_add(1000, self.update_tor_status_indicator)
@@ -2696,9 +3162,25 @@ class ShadowBrowser(Gtk.Application):
             self.show_error_message("Failed to toggle Tor. Please check the logs for more details.")
             self.update_tor_status_indicator()
 
+    def update_webview_tor_proxy(self, webview):
+        if not webview:
+            return
+        web_context = webview.get_context()
+        if self.tor_enabled and self.tor_manager and self.tor_manager.is_running():
+            if not self.tor_manager.setup_proxy(web_context):
+                pass
+        else:
+            self.clear_webview_proxy(web_context)
+
+    def clear_webview_proxy(self, web_context):
+        if hasattr(web_context, 'set_proxy_settings'):
+            web_context.set_proxy_settings(WebKit.NetworkProxySettings.new())
+        elif hasattr(web_context, 'set_network_proxy_settings'):
+            web_context.set_network_proxy_settings(WebKit.NetworkProxyMode.NO_PROXY, None)
+
     def update_tor_status_indicator(self):
         if not hasattr(self, 'tor_status_icon'):
-            return            
+            return
         if self.tor_enabled and hasattr(self, 'tor_manager') and self.tor_manager and self.tor_manager.is_running():
             icon_name = "network-transmit-receive-symbolic"
             tooltip = "Tor is enabled (click to disable)"
@@ -2706,8 +3188,8 @@ class ShadowBrowser(Gtk.Application):
         else:
             icon_name = "network-transmit-receive-symbolic"
             tooltip = "Tor is disabled (click to enable)"
-            opacity = 0.5           
-        self.tor_status_icon.set_from_icon_name(icon_name)       
+            opacity = 0.5
+        self.tor_status_icon.set_from_icon_name(icon_name)
         new_icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
         if hasattr(self.tor_status_button, 'get_child'):
             self.tor_status_button.remove(self.tor_status_button.get_child())
@@ -2715,16 +3197,80 @@ class ShadowBrowser(Gtk.Application):
             self.tor_status_icon = new_icon
         self.tor_status_icon.set_tooltip_text(tooltip)
         if hasattr(self.tor_status_icon.props, 'opacity'):
-            self.tor_status_icon.props.opacity = opacity       
-        self.tor_status_button.show_all()
-    
-    def on_tor_status_clicked(self, widget):
-        new_state = not (self.tor_enabled and hasattr(self, 'tor_manager') and 
-                       self.tor_manager and self.tor_manager.is_running())
-        self.toggle_tor(new_state)       
-        if new_state:
-            GLib.timeout_add(1000, self.update_tor_status_indicator)
-        return True
+            self.tor_status_icon.props.opacity = opacity
+        from gtk_compat import widget_show_all
+        widget_show_all(self.tor_status_button)
+
+    def update_tor_button(self):
+        if not hasattr(self, 'tor_button') or not self.tor_button:
+            return
+        is_tor_running = (self.tor_enabled and
+                        hasattr(self, 'tor_manager') and
+                        self.tor_manager and
+                        self.tor_manager.is_running())
+        if is_tor_running:
+            self.tor_button.set_label("🔗 Tor ON")
+            self.tor_button.set_tooltip_text("Tor is enabled - Click to disable")
+            css_provider = Gtk.CssProvider()
+            css_provider.load_from_data(b"""
+                .tor-button {
+                    background: #ADD8E6;
+                    color: black;
+                    border: 1px solid #45a049;
+                }
+            """)
+            display = self.tor_button.get_display() or Gdk.Display.get_default()
+            if display:
+                Gtk.StyleContext.add_provider_for_display(display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        else:
+            self.tor_button.set_label("⚪ Tor OFF")
+            self.tor_button.set_tooltip_text("Tor is disabled - Click to enable")
+            css_provider = Gtk.CssProvider()
+            css_provider.load_from_data(b"""
+                .tor-button {
+                    background: #ADD8E6;
+                    color: white;
+                    border: 1px solid #616161;
+                }
+            """)
+            display = self.tor_button.get_display() or Gdk.Display.get_default()
+            if display:
+                Gtk.StyleContext.add_provider_for_display(display, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def on_tor_button_clicked(self, button):
+        current_state = (self.tor_enabled and
+                        hasattr(self, 'tor_manager') and
+                        self.tor_manager and
+                        self.tor_manager.is_running())
+        new_state = not current_state
+        if self.toggle_tor(new_state):
+            with self.tabs_lock:
+                for tab in self.tabs:
+                    if hasattr(tab, 'webview'):
+                        self.update_webview_tor_proxy(tab.webview)
+                        GLib.idle_add(tab.webview.reload)
+            self.update_tor_button()
+            if new_state:
+                self.show_info_message("Tor enabled - All traffic now routed through Tor")
+            else:
+                self.show_info_message("Tor disabled - Using direct connection")
+        else:
+            self.show_error_message("Failed to toggle Tor connection")
+            self.update_tor_button()
+
+    def show_info_message(self, message):
+        try:
+            transient_for = self.window if hasattr(self, 'window') and self.window else None
+            dialog = Gtk.MessageDialog(
+                transient_for=transient_for,
+                modal=True,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+         )
+            dialog.connect("response", lambda d, r: d.destroy())
+            dialog.present()
+        except Exception:
+            pass
 
     def on_anti_fingerprinting_toggled(self, toggle_button):
         self.anti_fingerprinting_enabled = toggle_button.get_active()
@@ -2769,452 +3315,706 @@ class ShadowBrowser(Gtk.Application):
         dialog.set_child(main_box)
         return dialog
 
-    def on_clear_data_confirm(self, dialog):
-        if self.cookies_check.get_active():
-            self.clear_cookies()
-        if self.cache_check.get_active():
-            self.clear_cache()
-        if self.passwords_check.get_active():
-            self.clear_passwords()
-        if self.history_check.get_active():
-            self.clear_history()
-        dialog.close()
-
-    def on_clear_data_response(self, dialog, response_id):
-        if response_id == Gtk.ResponseType.ACCEPT:
-            if self.cookies_check.get_active():
-                self.clear_cookies()
-            if self.cache_check.get_active():
-                self.clear_cache()
-            if self.passwords_check.get_active():
-                self.clear_passwords()
-            if self.history_check.get_active():
-                self.clear_history()
-            self.show_message("Data Cleared", "The selected browsing data has been cleared.")
-        dialog.destroy()
-    
     def clear_cookies(self):
-        try:
-            context = WebKit.WebContext.get_default()
-            cookie_manager = context.get_cookie_manager()
-            if cookie_manager:
-                cookie_manager.delete_all_cookies()
-        except AttributeError:
-            try:
-                cookie_manager = WebKit.CookieManager.get_default()
-                if cookie_manager:
-                    cookie_manager.delete_all_cookies()
-            except AttributeError:
+        webview = self.get_current_webview()
+        if not webview:
+            return False
+        if hasattr(webview, 'get_website_data_manager'):
+            data_manager = webview.get_website_data_manager()
+            cookie_manager = data_manager.get_cookie_manager()
+        else:
+            context = webview.get_context()
+            if hasattr(context, 'get_cookie_manager'):
+                cookie_manager = context.get_cookie_manager()
+            else:
+                return False
+        if not cookie_manager:
+            return False
+
+        def on_cookies_deleted(manager, result, user_data=None):
+            success = manager.delete_all_cookies_finish(result)
+            if success:
                 pass
-        except Exception:
-            pass
+            else:
+                pass
+            cookie_manager.delete_all_cookies(None, on_cookies_deleted, None)
+            return True
 
     def clear_cache(self):
         try:
-            context = WebKit.WebContext.get_default()
-            if context:
+            webview = self.get_current_webview()
+            if not webview:
+                return False
+            context = webview.get_context()
+            if not context:
+                return False
+            try:
                 if hasattr(context, 'clear_cache'):
                     context.clear_cache()
-                elif hasattr(context, 'clear_cache_storage'):
-                    context.clear_cache_storage()
-        except Exception:
-            pass
-        
-    def clear_passwords(self):
-        try:
-            context = WebKit.WebContext.get_default()
-            if context and hasattr(context, 'clear_credentials'):
-                context.clear_credentials()
-        except Exception:
-            pass
-        
-    def clear_history(self):
-        if hasattr(self, 'history'):
-            self.history.clear()            
-            try:
-                self.save_json(HISTORY_FILE, [])
-                dialog = Gtk.MessageDialog(
-                    transient_for=self.window,
-                    message_type=Gtk.MessageType.INFO,
-                    buttons=Gtk.ButtonsType.OK,
-                    text="Browsing history has been cleared"
-                )
-                dialog.connect("response", lambda d, r: d.destroy())
-                dialog.present()
+                if hasattr(context, 'clear_website_data'):
+                    data_types = 0
+                    for attr in dir(WebKit.WebsiteDataTypes):
+                        if not attr.startswith('_'):
+                            data_types |= getattr(WebKit.WebsiteDataTypes, attr)
+                    if data_types > 0:
+                        context.clear_website_data(
+                            data_types,
+                            0,
+                            None, None, None
+                        )
+                current_uri = webview.get_uri()
+                if current_uri:
+                    webview.load_uri(current_uri)
+                return True
             except Exception:
-                pass
+                current_uri = webview.get_uri()
+                if current_uri:
+                    webview.load_uri(current_uri)
+                return True
+        except Exception:
+            return False
+
+    def clear_history(self):
+        self.history = []
+        self.save_json(HISTORY_FILE, self.history)
+
+    def on_clear_data_confirm(self, dialog):
+        if hasattr(self, 'cookies_check') and self.cookies_check.get_active():
+            self.clear_cookies()
+        if hasattr(self, 'cache_check') and self.cache_check.get_active():
+            self.clear_cache()
+        if hasattr(self, 'history_check') and self.history_check.get_active():
+            self.clear_history()
+        if hasattr(self, 'local_storage_check') and self.local_storage_check.get_active():
+            self.clear_all_data()
+        if dialog and dialog.is_visible():
+            dialog.destroy()
+
+    def on_clear_data_response(self, dialog, response_id):
+        if response_id == Gtk.ResponseType.OK:
+            self.on_clear_data_confirm(dialog)
+        dialog.destroy()
+
+    def clear_all_data(self):
+        data_types = 0
+        if hasattr(self, 'cookies_check') and self.cookies_check.get_active():
+            data_types |= WebKit.WebsiteDataTypes.COOKIES
+            data_types |= WebKit.WebsiteDataTypes.WEBSQL_DATABASES
+            data_types |= WebKit.WebsiteDataTypes.INDEXEDDB_DATABASE
+        if hasattr(self, 'cache_check') and self.cache_check.get_active():
+            data_types |= WebKit.WebsiteDataTypes.DISK_CACHE
+            data_types |= WebKit.WebsiteDataTypes.MEMORY_CACHE
+        if hasattr(self, 'history_check') and self.history_check.get_active():
+            self.history = []
+            self.save_json(HISTORY_FILE, self.history)
+        if hasattr(self, 'local_storage_check') and self.local_storage_check.get_active():
+            data_types |= WebKit.WebsiteDataTypes.LOCAL_STORAGE
+            data_types |= WebKit.WebsiteDataTypes.SESSION_STORAGE
+            data_types |= WebKit.WebsiteDataTypes.WEBSQL_DATABASES
+            data_types |= WebKit.WebsiteDataTypes.INDEXEDDB_DATABASE
+        if data_types == 0:
+            data_types = WebKit.WebsiteDataTypes.ALL
+
+    def on_data_cleared(self, manager, result, user_data=None):
+        manager.clear_finish(result)
+        self.show_info_message("✅ Browsing data cleared successfully")
+        notification = Gtk.InfoBar()
+        notification.set_message_type(Gtk.MessageType.INFO)
+        notification.add_button("_OK", Gtk.ResponseType.OK)
+        content = notification.get_content_area()
+        content.append(Gtk.Label(label="Browsing data has been cleared"))
+        if hasattr(self, 'window') and self.window:
+            overlay = Gtk.Overlay()
+            overlay.set_child(self.window.get_child())
+            overlay.add_overlay(notification)
+            self.window.set_child(overlay)
+            GLib.timeout_add_seconds(3, self._remove_notification, notification)
+
+    def _remove_notification(self, notification):
+        if hasattr(self, 'window') and self.window:
+            overlay = notification.get_parent()
+            if overlay and isinstance(overlay, Gtk.Overlay):
+                child = overlay.get_child()
+                overlay.unparent()
+                self.window.set_child(child)
+        return False
 
     def on_downloads_clicked(self, button):
         downloads_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD)
         if not downloads_dir:
             downloads_dir = os.path.expanduser("~/Downloads")
-        try:
-            import subprocess
-            subprocess.Popen(["xdg-open", downloads_dir])
-        except Exception:
-            pass
+        import subprocess
+        subprocess.Popen(["xdg-open", downloads_dir])
 
     def is_valid_url(self, url):
-        try:
-            result = urlparse(url)
-            return all([result.scheme, result.netloc])
-        except Exception:
-            return False
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
 
     def load_url(self, url):
-        """Load a URL in the current active webview."""
-        try:
-            if not url.startswith(("http://", "https://")):
-                if url.startswith("www."):
-                    url = "https://" + url
-                else:
-                    url = f"https://duckduckgo.com/?q={requests.utils.quote(url)}"
-            webview = self.get_current_webview()
-            if webview:
-                webview.load_uri(url)
+        if not url:
+            return
+        if not url.startswith(("http://", "https://")):
+            if url.startswith("www."):
+                url = "https://" + url
+            else:
+                url = f"https://{url}" if '://' not in url else url
+        webview = self.get_current_webview()
+        if webview is None and hasattr(self, 'webview') and self.webview is not None:
+            webview = self.webview
+        if webview:
+            webview.load_uri(url)
+            if hasattr(self, 'url_entry') and self.url_entry:
                 self.url_entry.set_text(url)
-                self.update_history(url)
-        except Exception:
-            pass
+            self.update_history(url)
 
     def on_add_bookmark_clicked(self, button):
-        """Handle Add Bookmark button click."""
         current_webview = self.get_current_webview()
         if current_webview:
             url = current_webview.get_uri()
             if url:
-                self.add_bookmark(url)
+                favicon = None
+                with self.favicon_lock:
+                    if url in self.favicon_cache:
+                        favicon = self.favicon_cache[url]
+                if favicon is not None:
+                    self.add_bookmark(url, favicon=favicon)
+                else:
+                    self.add_bookmark(url)
 
-    def add_bookmark(self, url):
-        """Add URL to bookmarks."""
+    def add_bookmark(self, url, title=None, favicon=None):
         if not url or not url.startswith(("http://", "https://")):
-            return
-        if url not in self.bookmarks:
-            self.bookmarks.append(url)
-            self.save_json(BOOKMARKS_FILE, self.bookmarks)
-            self.update_bookmarks_menu(self.bookmark_menu)
-            return True
-        return False
+            return False
+
+        def pixbuf_to_base64(pixbuf):
+            if not pixbuf or not hasattr(pixbuf, 'save_to_bufferv'):
+                return None
+            try:
+                success, buffer = pixbuf.save_to_bufferv('png', [], [])
+                if success and buffer:
+                    import base64
+                    return base64.b64encode(buffer).decode('utf-8')
+            except Exception:
+                return None
+
+        def process_favicon(icon):
+            if icon is None:
+                return None
+            if isinstance(icon, str):
+                return icon
+            if hasattr(icon, 'save_to_bufferv'):
+                return pixbuf_to_base64(icon)
+            if isinstance(icon, bytes):
+                try:
+                    return base64.b64encode(icon).decode('utf-8')
+                except Exception:
+                    return None
+            return None
+        favicon_data = process_favicon(favicon)
+        for i, bookmark in enumerate(self.bookmarks):
+            if isinstance(bookmark, dict) and bookmark.get('url') == url:
+                if title is not None:
+                    self.bookmarks[i]['title'] = title
+                if favicon_data is not None:
+                    self.bookmarks[i]['favicon'] = favicon_data
+                self.save_json(BOOKMARKS_FILE, self.bookmarks)
+                GLib.idle_add(self.update_bookmarks_menu, self.bookmark_menu)
+                return True
+            elif isinstance(bookmark, str) and bookmark == url:
+                self.bookmarks[i] = {
+                    'url': url,
+                    'title': title or url,
+                    'favicon': favicon_data
+                }
+                self.save_json(BOOKMARKS_FILE, self.bookmarks)
+                GLib.idle_add(self.update_bookmarks_menu, self.bookmark_menu)
+                return True
+        if title is None:
+            webview = self.get_current_webview()
+            title = webview.get_title() if webview else url
+        if isinstance(self.bookmarks, dict):
+            self.bookmarks = [{'url': k, 'title': v.get('title', k), 'favicon': v.get('favicon')}
+                           for k, v in self.bookmarks.items()]
+        if not isinstance(self.bookmarks, list):
+            self.bookmarks = []
+        self.bookmarks.append({
+            'url': url,
+            'title': title,
+            'favicon': favicon_data
+        })
+        self.save_json(BOOKMARKS_FILE, self.bookmarks)
+        GLib.idle_add(self.update_bookmarks_menu, self.bookmark_menu)
+        if favicon is None:
+
+            def update_favicon():
+                favicon_pixbuf = self.get_favicon(url)
+                if favicon_pixbuf:
+                    for i, bookmark in enumerate(self.bookmarks):
+                        if isinstance(bookmark, dict) and bookmark.get('url') == url:
+                            with self.favicon_lock:
+                                favicon_data = self.favicon_cache.get(url)
+                                if favicon_data:
+                                    if isinstance(favicon_data, bytes):
+                                        favicon_data = base64.b64encode(favicon_data).decode('utf-8')
+                                    self.bookmarks[i]['favicon'] = favicon_data
+                                    self.save_json(BOOKMARKS_FILE, self.bookmarks)
+                                    GLib.idle_add(self.update_bookmarks_menu, self.bookmark_menu)
+                                    break
+            threading.Thread(target=update_favicon, daemon=True).start()
+        return True
 
     def update_history(self, url):
-        """Add URL to browser history."""
         if url and url.startswith(("http://", "https://")):
             self.history.append({"url": url, "timestamp": time.time()})
             self.history = self.history[-HISTORY_LIMIT:]
             self.save_json(HISTORY_FILE, self.history)
 
-    def load_json(self, filename):
-        """Load JSON data from file."""
+    def load_json(self, filename, default=None):
+        if default is None:
+            default = {}
+        if not filename:
+            return default
         try:
-            if os.path.exists(filename):
-                with open(filename, "r") as f:
+            dirname = os.path.dirname(filename)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+            if not os.path.exists(filename):
+                with open(filename, 'w', encoding='utf-8') as f:
+                    json.dump(default, f, indent=2)
+                return default
+            with open(filename, 'r', encoding='utf-8') as f:
+                try:
                     return json.load(f)
-        except Exception:
-            pass
-        return []
+                except json.JSONDecodeError:
+                    try:
+                        backup_file = f"{filename}.corrupted.{int(time.time())}"
+                        shutil.copy2(filename, backup_file)
+                    except Exception:
+                        pass
+                    return default
+        except (FileNotFoundError, PermissionError, OSError):
+            return default
+        except (OSError, IOError):
+            return default
 
     def save_json(self, filename, data):
-        """Save JSON data to file."""
-        try:
-            with open(filename, "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+        with open(filename, "w") as f:
+            json.dump(data, f)
 
     def show_error_message(self, message):
         """Display an error message dialog."""
-        logging.basicConfig(
-            level=logging.DEBUG if self.debug_mode else logging.ERROR,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            filename='shadow_browser.log',
-            filemode='w'
-        )
-        if GST_AVAILABLE:
-            Gst.debug_remove_log_function(None)
-            Gst.debug_add_log_function(self._gst_log_handler, None)
-    
-    def _gst_log_handler(self, category, level, file, function, line, obj, message, user_data):
-        """Handle GStreamer log messages."""
-        if level >= Gst.DebugLevel.WARNING:
-            if self.debug_mode:
-                print(f"[GStreamer {level}] {message}")
-    
+        try:
+            dialog = Gtk.MessageDialog(
+                transient_for=self.window,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=message
+            )
+            dialog.connect("response", lambda d, r: d.destroy())
+            dialog.present()
+        except Exception:
+            pass
+
     def _init_gstreamer(self):
         """Initialize GStreamer with optimal settings."""
         if not GST_AVAILABLE:
-            return           
+            return
+        Gst.init_check(None)
+        os.environ['GST_PLUGIN_PATH'] = '/usr/lib/x86_64-linux-gnu/gstreamer-1.0/plugins'
+        if os.path.exists('/dev/dri'):
+            os.environ['GST_VAAPI_ALL_DRIVERS'] = '1'
+            os.environ['LIBVA_DRIVER_NAME'] = 'iHD'
+
+    def _load_texture_from_file(self, filepath):
         try:
-            Gst.init_check(None)
-            os.environ['GST_PLUGIN_PATH'] = '/usr/lib/x86_64-linux-gnu/gstreamer-1.0/plugins'
-            if os.path.exists('/dev/dri'):
-                os.environ['GST_VAAPI_ALL_DRIVERS'] = '1'
-                os.environ['LIBVA_DRIVER_NAME'] = 'iHD'
-            if self.debug_mode:
-                os.environ['GST_DEBUG'] = '3'
-                os.environ['GST_DEBUG_DUMP_DOT_DIR'] = '/tmp/gst-debug'
-                os.path.exists('/tmp/gst-debug') or os.makedirs('/tmp/gst-debug')
-        except Exception as e:
-            if self.debug_mode:
-                print(f"Error initializing GStreamer: {e}")
-        about_dialog = Gtk.AboutDialog(transient_for=self.window)
-        about_dialog.connect("response", lambda d, r: d.destroy())
-        about_dialog.present()
+            return Gdk.Texture.new_from_filename(filepath)
+        except Exception:
+            pass
+            return None
 
     def on_about(self, button):
-        """Show the about dialog."""
         about = Gtk.AboutDialog(transient_for=self.window)
         about.set_program_name("Shadow Browser")
-        about.set_version("1.0")
+        about.set_version("2.0")
         about.set_copyright(" 2025 ShadowyFigure")
         about.set_comments("A privacy-focused web browser")
         about.set_website("https://github.com/shadowyfigure/shadow-browser-")
         script_dir = os.path.dirname(os.path.abspath(__file__))
         image_path = os.path.join(script_dir, "background.png")
-        try:
-            if os.path.exists(image_path):
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
-                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
+        if os.path.exists(image_path):
+            texture = self._load_texture_from_file(image_path)
+            if texture:
                 about.set_logo(texture)
             else:
                 about.set_logo_icon_name("web-browser")
-        except Exception:
-            pass
+        else:
+            about.set_logo_icon_name("web-browser")
         about.present()
 
     def on_back_clicked(self, button):
-        """Handle back button click."""
         webview = self.get_current_webview()
         if webview and webview.can_go_back():
             webview.go_back()
 
+    def on_screenshot_clicked(self, button):
+        self.show_info_message("Screenshot functionality is currently disabled.")
+
     def on_new_tab_clicked(self, button):
-        """Handle New Tab button click."""
         self.add_new_tab(self.home_url)
 
     def safe_append(self, container, widget):
-        """
-        Safely append a widget to a container using the shared utility function.
-        Args:
-            container: The GTK container to append to
-            widget: The widget to append
-        Returns:
-            bool: True if append was successful, False otherwise
-        """
         return safe_widget_append(container, widget)
 
     def add_new_tab(self, url):
-        """Add a new tab with a webview loading the specified URL."""
-        try:
-            webview = self.create_secure_webview()
-            if webview is None:
-                return                
-            webview.load_uri(url)            
-            scrolled_window = Gtk.ScrolledWindow()
-            scrolled_window.set_vexpand(True)
-            scrolled_window.set_child(webview)           
-            label = Gtk.Label(label=self.extract_tab_title(url))
-            close_button = Gtk.Button.new_from_icon_name("window-close")
-            close_button.set_size_request(24, 24)
-            close_button.set_tooltip_text("Close tab")            
-            tab = Tab(url, webview)
-            tab.label_widget = label
-            tab.close_button = close_button
+        webview = self.create_secure_webview()
+        if webview is None:
+            print("Failed to create webview for new tab")
+            return
+        webview.load_uri(url)
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_vexpand(True)
+        scrolled_window.set_child(webview)
+        label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        title_label = Gtk.Label(label=self.extract_tab_title(url))
+        favicon_img = Gtk.Image()
+        favicon_img.set_size_request(16, 16)
+        favicon_img.set_visible(True)
+        label_box.prepend(favicon_img)
+        label_box.append(title_label)
+        close_button = Gtk.Button.new_from_icon_name("window-close")
+        close_button.set_size_request(24, 24)
+        close_button.set_tooltip_text("Close tab")
+        close_button.add_css_class("flat")
+        title_label.add_css_class("tab-label")
+        tab = Tab(url, webview, scrolled_window)
+        tab.label_widget = title_label
+        tab.label_box = label_box
+        tab.close_button = close_button
+        tab.favicon_widget = favicon_img
 
-            def on_close_clicked(button, tab=tab):
-                try:
-                    if tab in self.tabs:
-                        tab_index = self.tabs.index(tab)
-                        self.on_tab_close_clicked(button, tab_index)
-                except ValueError:
-                    pass
-                except Exception:
-                    pass
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            self.safe_append(box, label)
-            self.safe_append(box, close_button)            
-            if not self.notebook:
-                pass
-                return
-            index = self.notebook.append_page(scrolled_window, box)
-            self.notebook.set_current_page(index)    
-            self.tabs.append(tab)            
-            try:
-                close_button.connect("clicked", on_close_clicked)
-                webview.connect("load-changed", self.on_load_changed)
-                webview.connect("notify::title", self.on_title_changed)
-                webview.connect("decide-policy", self.on_decide_policy)
-            except Exception:
-                pass                
-        except Exception:
-            pass
+        def on_close_clicked(button, tab=tab):
+            if tab in self.tabs:
+                tab_index = self.tabs.index(tab)
+                self.on_tab_close_clicked(button, tab_index)
+        label_box.append(close_button)
+        close_button.connect("clicked", on_close_clicked)
+        webview.connect("notify::favicon", self._on_favicon_changed)
+        if not self.notebook:
+            return
+        index = self.notebook.append_page(scrolled_window, label_box)
+        self.notebook.set_current_page(index)
+        self.tabs.append(tab)
+        webview.connect("load-changed", self.on_load_changed)
+        webview.connect("notify::title", self.on_title_changed)
+        webview.connect("decide-policy", self.on_decide_policy)
+
+    def _page_contains_webview(self, page, webview):
+        if not page or not webview:
+            return False
+        scrolled_window = page.get_child()
+        if not scrolled_window:
+            return False
+        viewport = scrolled_window.get_child()
+        if not viewport:
+            return False
+        child = viewport.get_first_child()
+        return child == webview
 
     def on_tab_close_clicked(self, button, tab_index):
-        """Close the tab at the given index."""
-        try:
-            if 0 <= tab_index < len(self.tabs):
-                tab = self.tabs[tab_index]
-                webview = tab.webview
-                notebook_page_num = None               
-                for page_index in range(self.notebook.get_n_pages()):
-                    page = self.notebook.get_nth_page(page_index)
-                    if isinstance(page, Gtk.ScrolledWindow):
-                        child = page.get_child()
-                        if child == webview or (
-                            isinstance(child, Gtk.Viewport) and child.get_child() == webview
-                        ):
-                            notebook_page_num = page_index
-                            break               
-                if notebook_page_num is not None:
-                    page = self.notebook.get_nth_page(notebook_page_num)
-                    if page:
-                        if isinstance(page, Gtk.ScrolledWindow):
-                            child = page.get_child()
-                            if isinstance(child, Gtk.Viewport):
-                                webview = child.get_child()
-                            else:
-                                webview = child                        
-                        try:
-                            if webview:
-                                try:
-                                    if hasattr(webview, 'disconnect_by_func'):
-                                        webview.disconnect_by_func(self.on_load_changed)
-                                except Exception:
-                                    pass
-                                try:
-                                    if hasattr(webview, 'disconnect_by_func'):
-                                        webview.disconnect_by_func(self.on_title_changed)
-                                except Exception:
-                                    pass
-                                try:
-                                    if hasattr(webview, 'disconnect_by_func'):
-                                        webview.disconnect_by_func(self.on_decide_policy)
-                                except Exception:
-                                    pass
-                                try:
-                                    if hasattr(webview, 'disconnect_by_func'):
-                                        webview.disconnect_by_func(self.on_webview_create)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass               
-                        if notebook_page_num < self.notebook.get_n_pages():
-                            self.notebook.remove_page(notebook_page_num)               
-                        if webview and hasattr(webview, 'get_parent'):
-                            try:
-                                parent = webview.get_parent()
-                                if parent and webview in parent:
-                                    parent.remove(webview)
-                            except Exception:
-                                pass                       
-                        if page and hasattr(page, 'get_parent') and page.get_parent() == self.notebook:
-                            try:
-                                self.notebook.remove(page)
-                            except Exception:
-                                pass
-                                pass                       
-                        try:
-                            parent = page.get_parent()
-                            if parent and hasattr(parent, "remove") and page.get_parent() == parent:
-                                parent.remove(page)
-                        except Exception:
-                            pass              
-                removed_tab = self.tabs.pop(tab_index)               
-                try:
-                    if hasattr(removed_tab, 'webview'):
-                        removed_tab.webview = None
-                    if hasattr(removed_tab, 'label_widget'):
-                        removed_tab.label_widget = None
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if not (0 <= tab_index < len(self.tabs)):
+            return
+        tab = self.tabs.pop(tab_index)
+        webview = getattr(tab, "webview", None)
+        if not webview:
+            return
+        page_index = next(
+            (i for i in range(self.notebook.get_n_pages())
+            if self._page_contains_webview(self.notebook.get_nth_page(i), webview)),
+            None
+        )
+        if page_index is not None:
+            self.notebook.remove_page(page_index)
+        if hasattr(tab, "webview"):
+            tab.webview = None
+        if hasattr(tab, "label_widget"):
+            tab.label_widget = None
 
     def on_load_changed(self, webview, load_event):
-        """Handle load state changes."""
         from gi.repository import WebKit, GLib
-        try:
-            if not hasattr(self, 'download_spinner') or not self.download_spinner:
-                return                
-            if load_event == WebKit.LoadEvent.COMMITTED:
-                current_webview = self.get_current_webview()
-                if webview == current_webview:
-                    if hasattr(self, 'url_entry') and self.url_entry:
-                        current_url = webview.get_uri() or ""
-                        self.url_entry.set_text(current_url)                       
-                        for tab in self.tabs:
-                            if tab.webview == webview:
-                                tab.url = current_url
-                                if tab.label_widget and not webview.get_title():
-                                    tab.label_widget.set_text(self.extract_tab_title(current_url))
-                                break               
-                GLib.idle_add(self.download_spinner.start)
-                GLib.idle_add(lambda: self.download_spinner.set_visible(True))                
-            elif load_event == WebKit.LoadEvent.FINISHED:
-                current_url = webview.get_uri() or ""
-                if hasattr(self, 'url_entry') and self.url_entry and webview == self.get_current_webview():
-                    self.url_entry.set_text(current_url)                
-                for tab in self.tabs:
-                    if tab.webview == webview:
-                        tab.url = current_url
-                        if tab.label_widget and not webview.get_title():
-                            tab.label_widget.set_text(self.extract_tab_title(current_url))
-                        break               
+        if not hasattr(self, 'download_spinner') or not self.download_spinner:
+            return
+        current_webview = self.get_current_webview()
+        current_url = webview.get_uri() or ""
+        if any(ext in current_url.lower() for ext in ['.mp4', '.webm', '.m3u8', '.mpd', '.m3u', '.mp3', '.ogg', '.m4a', '.m4v']):
+            return
+        if load_event == WebKit.LoadEvent.COMMITTED:
+            if webview == current_webview:
+                if hasattr(self, 'url_entry') and self.url_entry:
+                    self.url_entry.set_text(current_url)
+                    for tab in self.tabs:
+                        if tab.webview == webview:
+                            tab.url = current_url
+                            if tab.label_widget and not webview.get_title():
+                                tab.label_widget.set_text(self.extract_tab_title(current_url))
+                            break
+                if not any(ext in current_url.lower() for ext in ['.mp4', '.webm', '.m3u8', '.mpd', '.m3u', '.mp3', '.ogg', '.m4a', '.m4v']):
+                    GLib.idle_add(self.download_spinner.start)
+                    GLib.idle_add(lambda: self.download_spinner.set_visible(True))
+        elif load_event == WebKit.LoadEvent.FINISHED:
+            if hasattr(self, 'url_entry') and self.url_entry and webview == current_webview:
+                self.url_entry.set_text(current_url)
+            for tab in self.tabs:
+                if tab.webview == webview:
+                    tab.url = current_url
+                    if tab.label_widget and not webview.get_title():
+                        tab.label_widget.set_text(self.extract_tab_title(current_url))
+                    break
+            uri = webview.get_uri()
+            if uri and uri.startswith(("http://", "https://")):
+                threading.Thread(
+                    target=self.fetch_favicon,
+                    args=(uri, lambda favicon: self.set_tab_favicon_from_fetch(webview, favicon)),
+                    daemon=True
+                ).start()
+            if not any(ext in current_url.lower() for ext in ['.mp4', '.webm', '.m3u8', '.mpd', '.m3u', '.mp3', '.ogg', '.m4a', '.m4v']):
                 GLib.idle_add(self.download_spinner.stop)
-                GLib.idle_add(lambda: self.download_spinner.set_visible(False))                
-                if current_url and not current_url.startswith(('about:', 'data:')):
-                    self.update_history(current_url)                   
-        except Exception:
-            pass
+                GLib.idle_add(lambda: self.download_spinner.set_visible(False))
+            if current_url and not current_url.startswith(('about:', 'data:')):
+                self.update_history(current_url)
 
     def on_title_changed(self, webview, param):
-        """Update tab label when page title changes."""
+        title = webview.get_title() or "Untitled"
+        url = webview.get_uri()
+        if not url:
+            return
+        max_length = getattr(self, "tab_title_max_length", 10)
+        display_title = title[:max_length - 3] + "..." if len(title) > max_length else title
+        tab = next((t for t in self.tabs if t.webview == webview), None)
+        if not tab:
+            return
+        if hasattr(tab.label_widget, "set_text"):
+            tab.label_widget.set_text(display_title)
+        if hasattr(tab, "_favicon_thread") and tab._favicon_thread.is_alive():
+            return
+
+        def update_favicon():
+            try:
+                favicon = self.get_favicon(url)
+                if favicon:
+                    GLib.idle_add(self._update_tab_favicon, tab, favicon)
+                    self._update_bookmark_favicon(url, favicon)
+            except Exception:
+                pass
+        tab._favicon_thread = threading.Thread(target=update_favicon, daemon=True)
+        tab._favicon_thread.start()
+
+    def _on_favicon_changed(self, webview, param):
+        if not webview or not hasattr(webview, 'get_uri'):
+            return
+        url = webview.get_uri()
+        if not url:
+            return
+        favicon = webview.get_favicon()
+        if not favicon:
+            return
+        with self.favicon_lock:
+            self.favicon_cache[url] = favicon
+        current_tab = next((t for t in getattr(self, 'tabs', []) if t.webview == webview), None)
+        if current_tab:
+            GLib.idle_add(self._update_tab_favicon, current_tab, favicon)
+        if hasattr(self, 'bookmarks'):
+            self._update_bookmark_favicon(url, favicon)
+
+    def set_tab_favicon_from_fetch(self, webview, favicon):
+        current_tab = next((t for t in getattr(self, 'tabs', []) if t.webview == webview), None)
+        if current_tab and favicon:
+            GLib.idle_add(self._update_tab_favicon, current_tab, favicon)
+
+    def set_tab_favicon(self, tab, paintable):
+        if paintable:
+            if not hasattr(tab, "favicon_widget") or not tab.favicon_widget:
+                tab.favicon_widget = Gtk.Image()
+                tab.favicon_widget.set_size_request(16, 16)
+                tab.label_box.prepend(tab.favicon_widget)
+            tab.favicon_widget.set_from_paintable(paintable)
+            tab.favicon = paintable
+            tab.favicon_widget.set_visible(True)
+        else:
+            self._set_fallback_favicon(tab)
+
+    def _update_bookmark_favicon(self, url, favicon):
+        if not url or not favicon or not hasattr(self, 'bookmarks'):
+            return
         try:
-            max_length = 10
-            title = webview.get_title() or "Untitled"
-            if len(title) > max_length:
-                title = title[: max_length - 3] + "..."
-            for i, tab in enumerate(self.tabs):
-                if tab.webview == webview and tab.label_widget is not None:
-                    tab.label_widget.set_text(title)
+            if hasattr(favicon, 'save_to_png_bytes'):
+                bytes_data = favicon.save_to_png_bytes()
+            elif hasattr(favicon, 'get_paintable'):
+                paintable = favicon.get_paintable()
+                if paintable and hasattr(paintable, 'save_to_png_bytes'):
+                    bytes_data = paintable.save_to_png_bytes()
+                else:
+                    return
+            elif isinstance(favicon, GLib.Bytes):
+                bytes_data = favicon.get_data()
+            else:
+                bytes_data = favicon
+            if not bytes_data:
+                return
+            if hasattr(bytes_data, 'get_data'):
+                bytes_data = bytes(bytes_data.get_data())
+            elif hasattr(bytes_data, 'tobytes'):
+                bytes_data = bytes_data.tobytes()
+            elif not isinstance(bytes_data, (bytes, bytearray)):
+                try:
+                    bytes_data = bytes(bytes_data)
+                except (TypeError, ValueError):
+                    return
+            base64_data = base64.b64encode(bytes_data).decode('utf-8')
+            if not base64_data:
+                return
+            updated = False
+            for i, bookmark in enumerate(self.bookmarks):
+                if isinstance(bookmark, dict) and bookmark.get('url') == url:
+                    self.bookmarks[i]['favicon'] = base64_data
+                    updated = True
                     break
+            if updated:
+                self.save_json(BOOKMARKS_FILE, self.bookmarks)
+                if hasattr(self, 'bookmark_menu'):
+                    GLib.idle_add(self.update_bookmarks_menu, self.bookmark_menu)
         except Exception:
             pass
 
-    def on_webview_create(self, webview, navigation_action, window_features=None):
-        """Handle creation of new webviews."""
+    def _create_texture_from_bytes(self, data, width, height, has_alpha=True):
         try:
-            if window_features is None:
-                return None               
-            new_webview = WebKit.WebView(
-                settings=webview.get_settings(), 
-                user_content_manager=webview.get_user_content_manager()
+            if hasattr(data, "get_data"):
+                data = data.get_data()
+            elif not isinstance(data, (bytes, bytearray)):
+                data = bytes(data)
+            bpp = 4 if has_alpha else 3
+            expected_stride = width * bpp
+            expected_total = expected_stride * height
+            if len(data) != expected_total:
+                row_len = len(data) // height if height > 0 else 0
+                if row_len != expected_stride and row_len > 0:
+                    fixed = bytearray()
+                    for y in range(height):
+                        start = y * row_len
+                        row = data[start : start + row_len]
+                        row = row.ljust(expected_stride, b"\x00")
+                        fixed.extend(row)
+                    data = bytes(fixed)
+                else:
+                    data = data.ljust(expected_total, b"\x00")
+            gbytes = GLib.Bytes.new(data)
+            fmt = (
+                Gdk.MemoryFormat.R8G8B8A8_PREMULTIPLIED
+                if has_alpha
+                else Gdk.MemoryFormat.R8G8B8
             )
-            new_webview.set_hexpand(True)
-            new_webview.set_vexpand(True)           
-            if not hasattr(new_webview, '_signals_connected'):
-                new_webview.connect("create", self.on_webview_create)
-                new_webview.connect("decide-policy", self.on_decide_policy)
-                new_webview._signals_connected = True                
-            is_popup = False
-            try:
-                if (
-                    window_features is not None
-                    and hasattr(window_features, "get")
-                    and callable(window_features.get)
-                ):
-                    try:
-                        is_popup = window_features.get("popup", False)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            if is_popup:
-                self.open_popup_window(new_webview, window_features)
-            else:
-                self.add_webview_to_tab(new_webview)
-            return new_webview
+            texture = Gdk.MemoryTexture.new(width, height, fmt, gbytes, expected_stride)
+            return texture
         except Exception:
             return None
+
+    def _update_tab_favicon(self, tab, favicon):
+        if not favicon or not hasattr(tab, "label_box"):
+            return
+        try:
+            if not hasattr(tab, "favicon_widget") or not tab.favicon_widget:
+                tab.favicon_widget = Gtk.Image()
+                tab.favicon_widget.set_size_request(16, 16)
+                tab.label_box.prepend(tab.favicon_widget)
+                tab.favicon_widget.set_visible(True)
+            tab.favicon_widget.set_visible(True)
+            if isinstance(favicon, Gdk.Texture):
+                tab.favicon_widget.set_from_paintable(favicon)
+                tab.favicon = favicon
+            elif isinstance(favicon, Gdk.Paintable):
+                tab.favicon_widget.set_from_paintable(favicon)
+                tab.favicon = favicon
+            elif isinstance(favicon, (bytes, bytearray, GLib.Bytes)):
+                try:
+                    data = favicon.get_data() if hasattr(favicon, "get_data") else favicon
+                    gbytes = GLib.Bytes.new(data)
+                    texture = Gdk.Texture.new_from_bytes(gbytes)
+                    tab.favicon_widget.set_from_paintable(texture)
+                    tab.favicon = texture
+                except Exception:
+                    self._set_fallback_favicon(tab)
+            elif isinstance(favicon, GdkPixbuf.Pixbuf):
+                tab.favicon_widget.set_from_pixbuf(favicon)
+                tab.favicon = favicon
+            else:
+                try:
+                    if hasattr(favicon, 'get_paintable'):
+                        paintable = favicon.get_paintable()
+                        tab.favicon_widget.set_from_paintable(paintable)
+                        tab.favicon = paintable
+                    else:
+                        tab.favicon_widget.set_from_paintable(favicon)
+                        tab.favicon = favicon
+                except Exception:
+                    self._set_fallback_favicon(tab)
+        except Exception:
+            pass
+
+    def on_webview_key_press(self, controller, keyval, keycode, state):
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        webview = controller.get_widget()
+        if keyval == Gdk.KEY_F12:
+            insp = webview.get_inspector() if hasattr(webview, 'get_inspector') else None
+            if insp and hasattr(insp, 'show'):
+                insp.show()
+                return True
+        if ctrl and shift and keyval in (Gdk.KEY_i, Gdk.KEY_I):
+            insp = webview.get_inspector() if hasattr(webview, 'get_inspector') else None
+            if insp and hasattr(insp, 'show'):
+                insp.show()
+                return True
+
+    def on_webview_context_menu(self, webview, context_menu, hit_test_result):
+        settings = getattr(webview, "get_settings", lambda: None)()
+        dev_enabled = False
+        if settings:
+            get_extras = getattr(settings, "get_enable_developer_extras", None)
+            if callable(get_extras):
+                dev_enabled = bool(get_extras())
+            elif hasattr(settings, "get_property"):
+                dev_enabled = bool(settings.get_property("enable-developer-extras"))
+        if not dev_enabled:
+            return False
+        if hasattr(WebKit, "ContextMenuItem") and hasattr(WebKit, "ContextMenuAction"):
+            item = WebKit.ContextMenuItem.new_from_stock_action(
+                WebKit.ContextMenuAction.INSPECT_ELEMENT
+            )
+            if item and hasattr(context_menu, "append"):
+                context_menu.append(item)
+                return False
+
+            def _activate_inspect(_item):
+                inspector = getattr(webview, "get_inspector", lambda: None)()
+                if inspector and hasattr(inspector, "show"):
+                    inspector.show()
+                    return
+                if hasattr(webview, "run_javascript"):
+                    js = (
+                        "(function(){"
+                        "if (window.webkit && window.webkit.messageHandlers) {"
+                        "console.log('Inspector requested');"
+                        "}"
+                        "})();"
+                    )
+                    webview.run_javascript(js, None, None, None)
+            if hasattr(WebKit, "ContextMenuItem"):
+                item = WebKit.ContextMenuItem.new_from_stock_action_with_label(
+                    WebKit.ContextMenuAction.NO_ACTION, "Inspect Element"
+                )
+                if hasattr(item, "connect"):
+                    item.connect("activate", _activate_inspect)
+                if hasattr(context_menu, "append"):
+                    context_menu.append(item)
+        return False
     BLOCKED_INTERNAL_URLS = [
         "about:blank",
         "about:srcdoc",
@@ -3225,14 +4025,6 @@ class ShadowBrowser(Gtk.Application):
     allow_about_blank = False
 
     def is_internal_url_blocked(self, url, is_main_frame):
-        """
-        Determine if an internal URL should be blocked.
-        Args:
-            url (str): The URL to check.
-            is_main_frame (bool): Whether the request is for the main frame.
-        Returns:
-            bool: True if the URL should be blocked, False otherwise.
-        """
         if not url:
             return False
         if url.startswith("about:blank") and not self.allow_about_blank:
@@ -3244,8 +4036,116 @@ class ShadowBrowser(Gtk.Application):
         return False
 
     def _handle_navigation_action(self, webview, decision, navigation_action):
-        """Handle navigation action policy decision."""
+        if not navigation_action:
+            decision.ignore()
+            return True
+        request = navigation_action.get_request()
+        if not request:
+            decision.ignore()
+            return True
+        requested_url = request.get_uri()
+        if not requested_url:
+            decision.ignore()
+            return True
+        lower_url = requested_url.lower()
+        if lower_url.startswith("javascript:"):
+            decision.ignore()
+            return True
+        is_main_frame = True
         try:
+            frame = getattr(navigation_action, "get_frame", lambda: None)()
+            if frame and hasattr(frame, "is_main_frame"):
+                is_main_frame = frame.is_main_frame()
+        except Exception:
+            pass
+        if self.is_internal_url_blocked(requested_url, is_main_frame):
+            decision.ignore()
+            return True
+        if lower_url.startswith(("about:", "data:", "blob:", "_data:", "_blank", "_parent", "_self", "_top", "_window")):
+            if not is_main_frame:
+                decision.ignore()
+                return True
+            decision.use()
+            return True
+        parsed = urlparse(requested_url)
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            decision.ignore()
+            return True
+        if not is_main_frame:
+            top_url = webview.get_uri()
+            if top_url:
+                top_host = urlparse(top_url).hostname
+                req_host = parsed.hostname
+                if top_host and req_host and top_host != req_host:
+                    decision.ignore()
+                    return True
+        if self.adblocker.is_blocked(requested_url):
+            decision.ignore()
+            return True
+        if lower_url.endswith(tuple(DOWNLOAD_EXTENSIONS)):
+            self.start_manual_download(requested_url)
+            decision.ignore()
+            return True
+        cleanup_js = """
+            document.querySelectorAll('a').forEach(a => {
+                if (
+                    (!a.textContent.trim() && !a.innerHTML.trim()) ||
+                    getComputedStyle(a).opacity === '0' ||
+                    getComputedStyle(a).visibility === 'hidden'
+                ) {
+                    a.remove();
+                }
+            });
+        """
+        try:
+            webview.evaluate_javascript(cleanup_js, -1, None, None, None, None)
+        except Exception:
+            try:
+                script = WebKit.UserScript.new(
+                    cleanup_js,
+                    WebKit.UserContentInjectedFrames.ALL_FRAMES,
+                    WebKit.UserScriptInjectionTime.END,
+                    None,
+                    None
+                )
+                webview.get_user_content_manager().add_script(script)
+            except Exception:
+                pass
+        decision.use()
+        return True
+
+    def _handle_new_window_action(self, webview, decision):
+        navigation_action = decision.get_navigation_action()
+        if navigation_action is None:
+            decision.ignore()
+            return True
+        request = navigation_action.get_request()
+        if request is None:
+            decision.ignore()
+            return True
+        url = request.get_uri()
+        if url is None:
+            decision.ignore()
+            return True
+        if url.lower() in ["about:blank", "javascript:void(0)"]:
+            decision.ignore()
+            return True
+        if url.lower().endswith(tuple(DOWNLOAD_EXTENSIONS)):
+            self.start_manual_download(url)
+            decision.ignore()
+            return True
+        new_webview = self.create_secure_webview()
+        if new_webview is None:
+            decision.ignore()
+            return True
+        self.add_webview_to_tab(new_webview)
+        new_webview.load_uri(url)
+        decision.ignore()
+        return True
+
+    def on_decide_policy(self, webview, decision, decision_type):
+        if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+            navigation_action = decision.get_navigation_action()
             if not navigation_action:
                 decision.ignore()
                 return True
@@ -3253,150 +4153,22 @@ class ShadowBrowser(Gtk.Application):
             if not request:
                 decision.ignore()
                 return True
-            requested_url = request.get_uri()
-            if not requested_url:
+            uri = request.get_uri()
+            if uri and uri.strip().lower().startswith('javascript:'):
+                js_uri = 'javascript:' + uri.split(':', 1)[1].lstrip()
+                self.open_url_in_new_tab(js_uri)
                 decision.ignore()
                 return True
-            is_main_frame = True
-            if hasattr(navigation_action, "get_frame"):
-                frame = navigation_action.get_frame()
-                if hasattr(frame, "is_main_frame"):
-                    try:
-                        is_main_frame = frame.is_main_frame()
-                    except Exception:
-                        pass
-            if self.is_internal_url_blocked(requested_url, is_main_frame):
-                decision.ignore()
-                return True
-            if requested_url.startswith(("about:", "data:", "blob:", "_data:", "_blank", "_parent", "_self", "_top", "_window")):
-                if not is_main_frame:
-                    decision.ignore()
-                    return True
+            if uri in ["about:blank#blocked", "about:blank"]:
                 decision.use()
                 return True
-            parsed = urlparse(requested_url)
-            if parsed.scheme not in ("http", "https"):
-                decision.ignore()
-                return True
-            if not is_main_frame:
-                top_level_url = webview.get_uri()
-                if top_level_url:
-                    top_host = urlparse(top_level_url).hostname
-                    req_host = parsed.hostname
-                    if top_host and req_host and top_host != req_host:
-                        decision.ignore()
-                        return True
-            if self.adblocker.is_blocked(requested_url):
-                decision.ignore()
-                return True
-            if requested_url.lower().endswith(tuple(DOWNLOAD_EXTENSIONS)):
-                self.start_manual_download(requested_url)
-                decision.ignore()
-                return True               
-            cleanup_js = """
-            document.querySelectorAll('a').forEach(a => {
-                if (
-                    (!a.textContent.trim() && !a.innerHTML.trim()) || 
-                    getComputedStyle(a).opacity === '0' || 
-                    getComputedStyle(a).visibility === 'hidden'
-                ) {
-                    a.remove();
-                }
-            });
-            """
-            try:
-                webview.evaluate_javascript(
-                    cleanup_js,
-                    -1,
-                    None,
-                    None,
-                    None,
-                    None
-                )
-            except Exception:
-                pass
-                try:
-                    script = WebKit.UserScript.new(
-                        cleanup_js,
-                        WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                        WebKit.UserScriptInjectionTime.END,
-                        None,
-                        None
-                    )
-                    webview.get_user_content_manager().add_script(script)
-                except Exception:
-                    pass           
-            decision.use()
-            return True           
-        except Exception:
-            pass
-            decision.ignore()
-            return True
-
-    def _handle_new_window_action(self, webview, decision):
-        """Handle new window action policy decision."""
-        try:
-            navigation_action = decision.get_navigation_action()
-            if navigation_action is None:
-                decision.ignore()
-                return True
-            request = navigation_action.get_request()
-            if request is None:
-                decision.ignore()
-                return True
-            url = request.get_uri()
-            if url is None:
-                decision.ignore()
-                return True
-            if url.lower() == "about:blank":
-                decision.ignore()
-                return True
-            if url.lower() == "javascript:void(0)":
-                decision.ignore()
-                return True
-            if url.lower().endswith(tuple(DOWNLOAD_EXTENSIONS)):
-                self.start_manual_download(url)
-                decision.ignore()
-                return True
-            user_content_manager = webview.get_user_content_manager()
-            new_webview = WebKit.WebView(user_content_manager=user_content_manager)
-            self.setup_webview_settings(new_webview)
-            self.download_manager.add_webview(new_webview)
-            if not hasattr(new_webview, "_create_signal_connected"):
-                new_webview.connect("create", self.on_webview_create)
-                new_webview._create_signal_connected = True
-            if not hasattr(new_webview, "_decide_policy_connected"):
-                new_webview.connect("decide-policy", self.on_decide_policy)
-                new_webview._decide_policy_connected = True
-            self.add_webview_to_tab(new_webview)
-            new_webview.load_uri(url)
-            decision.ignore()
-            return True
-        except Exception:
-            pass
-            decision.ignore()
-            return True
-
-    def on_decide_policy(self, webview, decision, decision_type):
-        """Handle navigation and new window actions, manage downloads, enforce policies, and apply adblock rules."""
-        try:
-            from gi.repository import WebKit
-            if decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
-                return self._handle_navigation_action(
-                    webview, decision, decision.get_navigation_action()
-                )
-            elif decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
-                return self._handle_new_window_action(webview, decision)
-            else:
-                decision.use()
-                return True
-        except Exception:
-            pass
-            decision.ignore()
-            return True
+            return self._handle_navigation_action(webview, decision, navigation_action)
+        elif decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
+            return self._handle_new_window_action(webview, decision)
+        decision.use()
+        return True
 
     def add_download_spinner(self, toolbar):
-        """Add download spinner to toolbar."""
         if toolbar:
             toolbar.append(self.download_spinner)
             self.download_spinner.set_halign(Gtk.Align.END)
@@ -3406,31 +4178,27 @@ class ShadowBrowser(Gtk.Application):
             self.download_spinner.set_visible(True)
 
     def start_manual_download(self, url):
-        """Manually download a file from the given URL."""
         import requests
         from urllib.parse import urlparse, unquote, parse_qs
 
         def sanitize_filename(filename):
-            """Sanitize and clean up the filename."""
             filename = re.sub(r'[?#].*$', '', filename)
             filename = re.sub(r'[?&][^/]+$', '', filename)
             filename = re.sub(r'[^\w\-_. ]', '_', filename).strip()
             return filename or 'download'
 
         def get_filename_from_url(parsed_url):
-            """Extract and clean filename from URL path."""
             path = unquote(parsed_url.path)
-            filename = os.path.basename(path)           
+            filename = os.path.basename(path)
             if not filename and parsed_url.path.endswith('/'):
-                filename = parsed_url.netloc.split('.')[-2] if '.' in parsed_url.netloc else 'file'           
+                filename = parsed_url.netloc.split('.')[-2] if '.' in parsed_url.netloc else 'file'
             if 'download' in parse_qs(parsed_url.query):
                 dl_param = parse_qs(parsed_url.query)['download'][0]
                 if dl_param:
-                    filename = unquote(dl_param)            
+                    filename = unquote(dl_param)
             return sanitize_filename(filename)
 
         def get_extension_from_content_type(content_type):
-            """Get appropriate file extension from content type."""
             content_type = (content_type or '').split(';')[0].lower()
             ext_map = {
                 'video/mp4': '.mp4',
@@ -3477,31 +4245,24 @@ class ShadowBrowser(Gtk.Application):
             return ext_map.get(content_type, '')
 
         def download_thread():
+            progress_info = {}
             try:
                 parsed_url = urlparse(url)
                 if not parsed_url.scheme or not parsed_url.netloc:
-                    GLib.idle_add(
-                        lambda: self.show_error_message("Invalid URL format"),
-                        priority=GLib.PRIORITY_DEFAULT,
-                    )
-                    return                
+                    raise ValueError("Invalid URL format")
                 headers = {
                     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                }               
+                }
                 with requests.get(url, stream=True, timeout=30, headers=headers) as response:
-                    response.raise_for_status()                  
+                    response.raise_for_status()
                     content_disposition = response.headers.get("content-disposition", "")
-                    filename = None                   
+                    filename = None
                     if content_disposition:
-                        filename_match = re.search(
-                            r'filename[^;=]*=([^;\n]*)', 
-                            content_disposition, 
-                            flags=re.IGNORECASE
-                        )
+                        filename_match = re.search(r'filename[^;=]*=([^;\n]*)', content_disposition, flags=re.IGNORECASE)
                         if filename_match:
                             filename = filename_match.group(1).strip('\'" ')
                             filename = unquote(filename)
-                            filename = sanitize_filename(filename)                    
+                            filename = sanitize_filename(filename)
                     if not filename:
                         filename = get_filename_from_url(parsed_url)
                     base_name, ext = os.path.splitext(filename)
@@ -3509,71 +4270,41 @@ class ShadowBrowser(Gtk.Application):
                         content_type = response.headers.get('content-type', '')
                         ext = get_extension_from_content_type(content_type)
                         if ext:
-                            filename = f"{base_name}{ext}"                    
-                    downloads_dir = GLib.get_user_special_dir(
-                        GLib.UserDirectory.DIRECTORY_DOWNLOAD
-                    ) or os.path.expanduser("~/Downloads")
-                    os.makedirs(downloads_dir, exist_ok=True)              
+                            filename = f"{base_name}{ext}"
+                    downloads_dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~/Downloads")
+                    os.makedirs(downloads_dir, exist_ok=True)
                     base_name, ext = os.path.splitext(filename)
                     counter = 1
                     while os.path.exists(os.path.join(downloads_dir, filename)):
                         filename = f"{base_name}_{counter}{ext}"
-                        counter += 1                        
+                        counter += 1
                     filepath = os.path.join(downloads_dir, filename)
                     total_size = int(response.headers.get("content-length", 0))
-                    block_size = 8192
-                    downloaded = 0
                     progress_info = {
                         "filename": filename,
                         "total_size": total_size,
-                        "downloaded": downloaded,
                         "cancelled": False,
-                        "thread_id": threading.current_thread().ident,
                     }
                     self.download_manager.add_progress_bar(progress_info)
-                    try:
-                        with open(filepath, "wb") as f:
-                            for chunk in response.iter_content(block_size):
-                                if progress_info["cancelled"]:
-                                    break
-                                if chunk:
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    progress = (
-                                        downloaded / total_size if total_size > 0 else 0
-                                    )
-                                    GLib.idle_add(
-                                        self.download_manager.update_progress,
-                                        progress_info,
-                                        progress,
-                                    )
-                        if not progress_info["cancelled"]:
-                            GLib.idle_add(
-                                self.download_manager.download_finished, progress_info
-                            )
-                    except Exception:
-                        GLib.idle_add(
-                            self.download_manager.download_failed,
-                            progress_info,
-                            "Error writing to file",
-                        )
-                    finally:
-                        GLib.idle_add(
-                            self.download_manager.cleanup_download,
-                            progress_info["filename"],
-                        )
-            except requests.exceptions.RequestException:
-                GLib.idle_add(
-                    self.download_manager.download_failed,
-                    None,
-                    "Download request failed",
-                )
-            except Exception:
-                GLib.idle_add(
-                    self.download_manager.download_failed,
-                    None,
-                    "Unexpected download error",
-                )
+                    with open(filepath, "wb") as f:
+                        downloaded = 0
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if progress_info["cancelled"]:
+                                break
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                progress = downloaded / total_size if total_size > 0 else 0
+                                GLib.idle_add(self.download_manager.update_progress, progress_info, progress)
+                    if not progress_info["cancelled"]:
+                        GLib.idle_add(self.download_manager.download_finished, progress_info)
+            except requests.exceptions.RequestException as e:
+                GLib.idle_add(self.download_manager.download_failed, progress_info, f"Download request failed: {e}")
+            except Exception as e:
+                GLib.idle_add(self.download_manager.download_failed, progress_info, f"Unexpected download error: {e}")
+            finally:
+                if progress_info:
+                    GLib.idle_add(self.download_manager.cleanup_download, progress_info["filename"])
         thread = threading.Thread(
             target=download_thread, daemon=True, name=f"download_{url}"
         )
@@ -3581,25 +4312,21 @@ class ShadowBrowser(Gtk.Application):
         return thread.ident
 
     def on_forward_clicked(self, button):
-        """Navigate forward in the current tab."""
         webview = self.get_current_webview()
         if webview and webview.can_go_forward():
             webview.go_forward()
 
     def on_go_clicked(self, button):
-        """Load URL from URL entry."""
         url = self.url_entry.get_text().strip()
         if url:
             self.load_url(url)
 
     def on_refresh_clicked(self, button):
-        """Reload the current webview."""
         webview = self.get_current_webview()
         if webview:
             webview.reload()
 
     def extract_tab_title(self, url):
-        """Extract a display title from a URL, limited to 30 characters."""
         max_length = 30
         try:
             parsed = urlparse(url)
@@ -3611,23 +4338,20 @@ class ShadowBrowser(Gtk.Application):
             return "New Tab"
 
     def save_session(self):
-        """Save current browser session."""
         session_data = [
             {
                 "url": tab.url,
-                "title": tab.label_widget.get_text() if tab.label_widget else "",
+                "title": tab.title_label.get_text() if hasattr(tab, 'title_label') and tab.title_label else "",
             }
             for tab in self.tabs
         ]
         self.save_json(SESSION_FILE, session_data)
 
     def save_tabs(self):
-        """Save current tabs info."""
         tabs_data = [tab.url for tab in self.tabs if tab.url]
         self.save_json(TABS_FILE, tabs_data)
 
     def restore_session(self):
-        """Restore previous session."""
         if os.path.exists(SESSION_FILE):
             session_data = self.load_json(SESSION_FILE)
             if session_data and isinstance(session_data, list):
@@ -3636,46 +4360,31 @@ class ShadowBrowser(Gtk.Application):
                         self.add_new_tab(tab_data["url"])
 
     def apply_theme(self):
-        """Apply the current theme setting."""
         settings = Gtk.Settings.get_default()
         settings.set_property("gtk-application-prefer-dark-theme", self.theme == "dark")
 
     def safe_window_cleanup(self):
-        """Ensure proper window cleanup to prevent GTK warnings."""
-        if hasattr(self, 'window') and self.window:
-            try:
-                if hasattr(self.window, 'disconnect_by_func'):
-                    try:
-                        self.window.disconnect_by_func(self.on_window_destroy)
-                    except Exception:
-                        pass              
-                if self.window.get_child():
-                    child = self.window.get_child()
-                    if child:
-                        try:
-                            self.window.remove(child)
-                        except Exception:
-                            pass                
-                self.window.destroy()
-                self.window = None
-            except Exception:
-                pass
+        if not hasattr(self, 'window') or not self.window:
+            return
+        if hasattr(self.window, 'disconnect_by_func'):
+            self.window.disconnect_by_func(self.on_window_destroy)
+        if hasattr(self.window, 'get_child'):
+            child = self.window.get_child()
+            if child and hasattr(child, 'destroy'):
+                    if hasattr(child, 'remove'):
+                        self.window.remove(child)
+                    child.destroy()
+        if hasattr(self.window, 'destroy'):
+            self.window.destroy()
+        self.window = None
 
     def cleanup_widgets(self):
-        """Clean up all widgets to prevent GTK warnings."""
         for tab in self.tabs[:]:
             if hasattr(tab, 'webview') and tab.webview:
-                try:
-                    tab.webview.disconnect_by_func(self.on_load_changed)
-                    tab.webview.disconnect_by_func(self.on_title_changed)
-                    tab.webview.disconnect_by_func(self.on_decide_policy)
-                    tab.webview.disconnect_by_func(self.on_webview_create)
-                except Exception:
-                    pass
                 tab.webview = None
-            if hasattr(tab, 'label_widget'):
-                tab.label_widget = None       
-        self.tabs.clear()       
+            if hasattr(tab, 'title_label'):
+                tab.title_label = None
+        self.tabs.clear()
         if hasattr(self, 'notebook') and self.notebook:
             try:
                 for i in range(self.notebook.get_n_pages() - 1, -1, -1):
@@ -3689,73 +4398,72 @@ class ShadowBrowser(Gtk.Application):
                 pass
 
     def disconnect_all_signals(self):
-        """Disconnect all signals to prevent GTK warnings."""
-        for webview in [tab.webview for tab in self.tabs if hasattr(tab, 'webview')]:
-            try:
-                webview.disconnect_by_func(self.on_load_changed)
-                webview.disconnect_by_func(self.on_title_changed)
-                webview.disconnect_by_func(self.on_decide_policy)
-                webview.disconnect_by_func(self.on_webview_create)
-            except Exception:
-                pass
+        pass
 
     def on_window_destroy(self, window):
-        """Handle window closure with proper cleanup."""
-        try:
-            self.save_session()
-            self.save_tabs()           
-            self.cleanup_widgets()
-            self.disconnect_all_signals()            
-            if hasattr(self, '_popup_windows'):
-                try:
-                    for popup in self._popup_windows:
-                        try:
-                            popup.destroy()
-                        except Exception:
-                            pass
-                    self._popup_windows = []
-                except Exception:
-                    pass           
-            if hasattr(self, 'download_manager') and self.download_manager:
-                try:
-                    self.download_manager.clear_all()
-                    self.download_manager = None
-                except Exception:
-                    pass            
-            self.safe_window_cleanup()           
-        except Exception:
-            pass
-        finally:
-            self.quit()
+        self.save_session()
+        self.save_tabs()
+        self.cleanup_widgets()
+        self.disconnect_all_signals()
+        if hasattr(self, '_popup_windows'):
+            try:
+                for popup in self._popup_windows:
+                    try:
+                        popup.destroy()
+                    except Exception:
+                        pass
+                self._popup_windows = []
+            except Exception:
+                pass
+        if hasattr(self, 'download_manager') and self.download_manager:
+            try:
+                self.download_manager.clear_all()
+                self.download_manager = None
+            except Exception:
+                pass
+        self.safe_window_cleanup()
+        self.quit()
 
     def simulate_left_click_on_void_link(self, data_url):
+        webview = self.get_current_webview()
+        if not webview:
+            return False
         js_code = (
             "(function() {"
-            "let links = document.querySelectorAll('a[href=\"javascript:void(0)\"]');"
-            f"let targetDataUrl = {json.dumps(data_url)};"
-            "for (let link of links) {"
-            "if (link.getAttribute('data-url') === targetDataUrl) {"
-            "['mousedown', 'mouseup', 'click'].forEach(eventType => {"
-            "let event = new MouseEvent(eventType, { view: window, bubbles: true, cancelable: true, button: 0 });"
-            "link.dispatchEvent(event);"
-            "});"
-            "return true;"
-            "}"
+            "const targetDataUrl = %s;"
+            "const links = document.querySelectorAll('a');"
+            "for (const link of links) {"
+            "  if (link.getAttribute('data-url') === targetDataUrl) {"
+            "    ['mousedown', 'mouseup', 'click'].forEach(type => {"
+            "      const event = new MouseEvent(type, {"
+            "        view: window,"
+            "        bubbles: true,"
+            "        cancelable: true,"
+            "        button: 0,"
+            "        buttons: 1,"
+            "        detail: 1"
+            "      });"
+            "      link.dispatchEvent(event);"
+            "    });"
+            "    return true;"
+            "  }"
             "}"
             "return false;"
             "})();"
-        )
-        webview = self.get_current_webview()
-        if webview:
-            webview.evaluate_javascript(js_code, self.js_callback)
+        ) % json.dumps(data_url)
+        try:
+            webview.evaluate_javascript(
+                js_code,
+                None,
+                None,
+                self._on_js_click_result
+            )
+            return True
+        except Exception:
+            return False
 
-        def js_callback(self, webview, result):
-            try:
-                if result is None:
-                    return
-                webview.evaluate_javascript_finish(result)
-            except Exception:
-                pass
+    def _on_js_click_result(self, webview, result, user_data):
+        webview.run_javascript_finish(result)
 
     def test_js_execution(self):
         webview = self.get_current_webview()
@@ -3763,172 +4471,346 @@ class ShadowBrowser(Gtk.Application):
             js_code = "console.log('Test JS execution in webview'); 'JS executed';"
             webview.evaluate_javascript(js_code, self.js_callback)
 
-    def open_url_in_new_tab(self, url):
-        """Open a URL in a new tab."""
+    def _on_js_executed(self, webview, result, user_data):
+        webview.run_javascript_finish(result)
+
+    def _on_webview_load_changed(self, webview, load_event):
+        if load_event == WebKit.LoadEvent.STARTED:
+            self._update_loading_state(webview, True)
+        elif load_event == WebKit.LoadEvent.COMMITTED:
+            self._inject_early_page_fixes(webview)
+        elif load_event == WebKit.LoadEvent.FINISHED:
+            self._update_loading_state(webview, False)
+            self._handle_page_completion(webview)
+
+    def _inject_early_page_fixes(self, webview):
         try:
-            if not url or not isinstance(url, str):
-                return                
-            if url.startswith("javascript:") or url == "about:blank":
-                return               
-            new_webview = self.create_secure_webview()
-            if new_webview is None:
-                return               
-            new_webview.load_uri(url)            
-            scrolled_window = Gtk.ScrolledWindow()
-            scrolled_window.set_vexpand(True)
-            scrolled_window.set_child(new_webview)            
-            label = Gtk.Label(label=self.extract_tab_title(url))            
-            close_button = Gtk.Button.new_from_icon_name("window-close")
-            close_button.set_size_request(24, 24)
-            close_button.set_tooltip_text("Close tab")           
-            tab = Tab(url, new_webview)
-            tab.label_widget = label
-            
-            def on_close_clicked(button, tab=tab):
-                try:
-                    tab_index = self.tabs.index(tab)
-                    self.on_tab_close_clicked(button, tab_index)
-                except ValueError:
-                    pass            
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            self.safe_append(box, label)
-            self.safe_append(box, close_button)            
-            index = self.notebook.append_page(scrolled_window, box)
-            self.notebook.set_current_page(index)            
-            self.tabs.append(tab)            
-            close_button.connect("clicked", on_close_clicked)            
-            new_webview.connect("load-changed", self.on_load_changed)
-            new_webview.connect("notify::title", self.on_title_changed)
-            new_webview.connect("decide-policy", self.on_decide_policy)
-            new_webview.connect("create", self.on_webview_create)            
+            early_fix_script = """
+            (function() {
+                console.log('[WebKitGTK] Injecting early page fixes...');
+                // Prevent common loading issues
+                if (typeof document.addEventListener !== 'undefined') {
+                    document.addEventListener('DOMContentLoaded', function() {
+                        console.log('[WebKitGTK] DOM loaded, applying fixes...');
+                        // Force layout recalculation
+                        if (document.body) {
+                            document.body.offsetHeight;
+                        }
+                        // Re-initialize common scripts that might have failed
+                        setTimeout(function() {
+                            // Try to re-execute failed initializations
+                            if (typeof window.init === 'function') {
+                                try { window.init(); } catch(e) { console.log('[WebKitGTK] init() failed:', e); }
+                            }
+                            if (typeof window.setup === 'function') {
+                                try { window.setup(); } catch(e) { console.log('[WebKitGTK] setup() failed:', e); }
+                            }
+                            if (typeof window.load === 'function') {
+                                try { window.load(); } catch(e) { console.log('[WebKitGTK] load() failed:', e); }
+                            }
+                        }, 100);
+                    });
+                }
+            })();
+            """
+            webview.evaluate_javascript(early_fix_script, -1, None, None, None)
         except Exception:
             pass
 
-    def add_webview_to_tab(self, webview):
-        """Add a webview to a new tab."""
+    def _handle_page_completion(self, webview):
+        completion_script = """
+        (function() {
+            console.log('[WebKitGTK] Page load completed, checking for issues...');
+            // Check if page loaded properly
+            var hasContent = document.body && document.body.innerHTML.trim().length > 0;
+            var hasImages = document.querySelectorAll('img').length > 0;
+            var hasScripts = document.querySelectorAll('script').length > 0;
+            console.log('[WebKitGTK] Content check:', {
+                hasContent: hasContent,
+                hasImages: hasImages,
+                hasScripts: hasScripts,
+                bodyHTML: document.body ? document.body.innerHTML.substring(0, 200) : 'No body'
+            });
+            // If page seems incomplete, trigger a soft refresh
+            if (!hasContent || (hasScripts && document.readyState === 'complete')) {
+                setTimeout(function() {
+                    console.log('[WebKitGTK] Triggering soft refresh for incomplete page...');
+                    // Force reflow and re-execute scripts
+                    if (document.body) {
+                        var originalHTML = document.body.innerHTML;
+                        document.body.style.display = 'none';
+                        document.body.offsetHeight; // Force reflow
+                        document.body.style.display = '';
+                        // Re-trigger common events
+                        var event = new Event('DOMContentLoaded');
+                        document.dispatchEvent(event);
+                        var loadEvent = new Event('load');
+                        window.dispatchEvent(loadEvent);
+                    }
+                }, 500);
+            }
+            // Apply WebKitGTK compatibility fixes
+            if (typeof window.webkit === 'undefined') {
+                console.log('[WebKitGTK] Applying compatibility layer...');
+                // Basic polyfills will be injected by the main compatibility script
+            }
+        })();
+        """
+        webview.evaluate_javascript(completion_script, -1, None, None, None)
+
+    def _update_loading_state(self, webview, loading):
+        if hasattr(self, 'statusbar') and self.statusbar:
+            self.statusbar.set_visible(loading)
+            if loading:
+                self.statusbar.push(0, "Loading...")
+        if hasattr(self, 'refresh_button') and self.refresh_button:
+            self.refresh_button.set_sensitive(not loading)
+
+    def _on_webview_loaded(self, webview, load_event, js_code=None):
+        if load_event == WebKit.LoadEvent.FINISHED and js_code:
+            webview.run_javascript("""
+                if (document.readyState === 'complete' || document.readyState === 'interactive') {
+                    return true;
+                } else {
+                    return new Promise(resolve => {
+                        window.addEventListener('DOMContentLoaded', () => resolve(true));
+                    });
+                }
+            """, None, self._execute_js_after_ready, js_code)
+
+    def detect_environment(self):
         try:
-            scrolled_window = Gtk.ScrolledWindow()
-            scrolled_window.set_vexpand(True)
-            scrolled_window.set_child(webview)
-            label = Gtk.Label(label=self.extract_tab_title(webview.get_uri()))
-            close_button = Gtk.Button.new_from_icon_name("window-close")
-            close_button.set_size_request(24, 24)
-            tab = Tab(webview.get_uri(), webview)
-            def on_close_clicked(button, tab=tab):
-                try:
-                    tab_index = self.tabs.index(tab)
-                    self.on_tab_close_clicked(button, tab_index)
-                except ValueError:
-                    pass
-            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-            self.safe_append(box, label)
-            self.safe_append(box, close_button)
-            index = self.notebook.append_page(scrolled_window, box)
-            self.tabs.append(tab)
-            close_button.connect("clicked", on_close_clicked)
-            self.notebook.set_current_page(index)
-            webview.connect("load-changed", self.on_load_changed)
-            webview.connect("notify::title", self.on_title_changed)
-            webview.connect("decide-policy", self.on_decide_policy)
-        except Exception:
-            pass
+            if os.path.exists('/.flatpak-info'):
+                return 'flatpak'
+            if 'SNAP' in os.environ:
+                return 'snap'
+            if os.path.exists('/proc/self/exe') and 'appimage' in os.readlink('/proc/self/exe'):
+                return 'appimage'
+            return 'native'
+        except (OSError, FileNotFoundError, PermissionError):
+            return 'unknown'
+
+    def check_file_access(self, file_path):
+        try:
+            with open(file_path, 'rb') as f:
+                f.read(1)
+            return True
+        except (IOError, OSError, PermissionError):
+            return False
+
+    def _execute_js_after_ready(self, webview, result, js_code):
+        webview.run_javascript_finish(result)
+        webview.run_javascript(js_code, None, self._on_js_executed, None)
+
+    def open_url_in_new_tab(self, url, execute_js=True):
+        if not url or not isinstance(url, str):
+            return
+        if url.startswith('file://'):
+            parsed = urlparse(url)
+            file_path = unquote(parsed.path)
+            abs_path = Path(file_path).resolve()
+            if not abs_path.exists():
+                return
+            if not abs_path.is_file():
+                return
+            file_accessible = self.check_file_access(str(abs_path))
+            if not file_accessible:
+                with open(abs_path, 'rb') as f:
+                    content = f.read()
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(str(abs_path))
+                if mime_type is None:
+                    mime_type = 'text/html' if abs_path.suffix.lower() in ['.html', '.htm'] else 'text/plain'
+                encoded_content = base64.b64encode(content).decode('utf-8')
+                url = f"data:{mime_type};base64,{encoded_content}"
+            else:
+                url = f"file://{quote(str(abs_path))}"
+        elif os.path.exists(url):
+            file_path = url
+            abs_path = Path(file_path).resolve()
+            if not abs_path.exists():
+                return
+            if not abs_path.is_file():
+                return
+            file_accessible = self.check_file_access(str(abs_path))
+            if not file_accessible:
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(str(abs_path))
+                if mime_type is None:
+                    mime_type = 'text/html' if abs_path.suffix.lower() in ['.html', '.htm'] else 'text/plain'
+            try:
+                with open(abs_path, 'rb') as f:
+                    content = f.read()
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(str(abs_path))
+                if mime_type is None:
+                    mime_type = 'text/html' if abs_path.suffix.lower() in ['.html', '.htm'] else 'text/plain'
+                encoded_content = base64.b64encode(content).decode('utf-8')
+                url = f"data:{mime_type};base64,{encoded_content}"
+            except Exception:
+                return
+            else:
+                url = f"file://{quote(str(abs_path))}"
+        new_webview = self.create_secure_webview()
+        if new_webview is None:
+            return
+        new_webview.set_vexpand(True)
+        new_webview.set_hexpand(True)
+        new_webview.connect('load-changed', self.on_load_changed)
+        new_webview.connect('notify::title', self.on_title_changed)
+        new_webview.connect('decide-policy', self.on_decide_policy)
+        new_webview.connect('create', self.on_webview_create)
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_vexpand(True)
+        scrolled_window.set_child(new_webview)
+        label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        title_label = Gtk.Label(label=self.extract_tab_title(url))
+        label_box.append(title_label)
+        close_button = Gtk.Button.new_from_icon_name("window-close")
+        close_button.set_size_request(24, 24)
+        close_button.set_tooltip_text("Close tab")
+        tab = Tab(url, new_webview, scrolled_window)
+        tab.label_widget = title_label
+        tab.label_box = label_box
+        tab.close_button = close_button
+        self.tabs.append(tab)
+
+        def on_close_clicked(button, tab=tab):
+            try:
+                tab_index = self.tabs.index(tab)
+                self.on_tab_close_clicked(button, tab_index)
+            except ValueError:
+                pass
+        label_box.append(close_button)
+        close_button.connect("clicked", on_close_clicked)
+        new_webview.connect("notify::favicon", self._on_favicon_changed)
+        index = self.notebook.append_page(scrolled_window, label_box)
+        self.notebook.set_current_page(index)
+        self.tabs.append(tab)
+        if url.lower().startswith("javascript:"):
+            if not execute_js:
+                return
+            js_code = url[11:].strip()
+            if not js_code:
+                return
+
+            def on_js_webview_loaded(webview, load_event, js_code):
+                if load_event == WebKit.LoadEvent.FINISHED:
+                    webview.run_javascript("""
+                        if (document.readyState === 'complete' || document.readyState === 'interactive') {
+                            return true;
+                        } else {
+                            return new Promise(resolve => {
+                                document.addEventListener('DOMContentLoaded', () => resolve(true));
+                            });
+                        }
+                    """, None, self._execute_js_after_ready, js_code)
+                    webview.disconnect_by_func(on_js_webview_loaded)
+            new_webview.connect('load-changed', on_js_webview_loaded, js_code)
+            new_webview.load_uri("about:blank")
+        else:
+            new_webview.load_uri(url)
+        self.notebook.set_visible(True)
+
+    def add_webview_to_tab(self, webview, is_terminal=False):
+        if is_terminal and not hasattr(webview, 'is_terminal'):
+            webview.is_terminal = True
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_vexpand(True)
+        scrolled_window.set_child(webview)
+        label_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        title_text = "Terminal" if is_terminal else self.extract_tab_title(webview.get_uri() or "New Tab")
+        title_label = Gtk.Label(label=title_text)
+        label_box.append(title_label)
+        close_button = Gtk.Button.new_from_icon_name("window-close")
+        close_button.set_size_request(24, 24)
+        close_button.add_css_class("flat")
+        close_button.set_tooltip_text("Close tab")
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        header_box.append(label_box)
+        header_box.append(close_button)
+        tab = Tab(webview.get_uri() or ("terminal" if is_terminal else ""), webview, scrolled_window)
+        tab.title_label = title_label
+        tab.close_button = close_button
+        tab.header_box = header_box
+        tab.is_terminal = is_terminal
+        index = self.notebook.append_page(scrolled_window, header_box)
+        self.tabs.append(tab)
+        # Connect close button with correct tab index (after tab is added)
+        close_button.connect("clicked", self.on_tab_close_clicked, len(self.tabs) - 1)
+        self.notebook.set_current_page(index)
+        return tab
 
     def open_popup_window(self, webview, window_features):
-        """Open a popup window with the given webview."""
         try:
             window = Gtk.Window(title="Popup")
-            window.set_transient_for(self.window)
+            if hasattr(self, 'window') and self.window:
+                window.set_transient_for(self.window)
             window.set_destroy_with_parent(True)
             window.set_modal(False)
-            if window_features:
-                default_width = int(window_features.get_width() or 800)
-                default_height = int(window_features.get_height() or 600)
-                window.set_default_size(default_width, default_height)           
-            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)            
+            if window_features and hasattr(window_features, 'get_width') and hasattr(window_features, 'get_height'):
+                try:
+                    width = window_features.get_width()
+                    height = window_features.get_height()
+                    default_width = int(width) if width is not None else 800
+                    default_height = int(height) if height is not None else 600
+                    window.set_default_size(default_width, default_height)
+                except (ValueError, TypeError):
+                    window.set_default_size(800, 600)
+            else:
+                window.set_default_size(800, 600)
+            vbox = Gtk.Box.new(Gtk.Orientation.VERTICAL, 0)
+            vbox.set_ox(orientation=Gtk.Orientation.VERTICAL)
             if hasattr(webview, 'get_parent') and webview.get_parent() is not None:
                 parent = webview.get_parent()
                 if parent and hasattr(parent, "remove") and webview.get_parent() == parent:
-                    try:
-                        parent.remove(webview)
-                    except Exception:
-                        pass            
-            self.safe_append(vbox, webview)           
-            close_button = Gtk.Button.new_from_icon_name("window-close")
-            close_button.set_size_request(24, 24)
-            close_button.set_tooltip_text("Close popup")            
-            window._webview = webview
-            window._close_button = close_button
-            window._vbox = vbox
-                    
-            def on_popup_destroy(widget):
-                try:
+                    parent.remove(webview)
+                self.safe_append(vbox, webview)
+                close_button = Gtk.Button.new_from_icon_name("window-close")
+                close_button.set_size_request(24, 24)
+                close_button.set_tooltip_text("Close popup")
+                window._webview = webview
+                window._close_button = close_button
+                close_button.connect("clicked", lambda btn: window.close())
+                header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                header_box.append(close_button)
+                vbox.append(header_box)
+                window.set_child(vbox)
+
+                def on_popup_destroy(widget):
                     if hasattr(window, '_webview'):
                         window._webview = None
                     if hasattr(window, '_close_button'):
                         window._close_button = None
                     if hasattr(window, '_vbox'):
                         window._vbox = None
-                except Exception:
-                    pass            
-            window.connect("destroy", on_popup_destroy)
-            close_button.connect("clicked", lambda btn: window.destroy())           
-            if hasattr(close_button, 'get_parent') and close_button.get_parent() is not None:
-                parent = close_button.get_parent()
-                if parent and hasattr(parent, "remove") and close_button.get_parent() == parent:
-                    try:
-                        parent.remove(close_button)
-                    except Exception:
-                        pass           
-            self.safe_append(vbox, close_button)
-            window.set_child(vbox)            
-            if not hasattr(self, '_popup_windows'):
-                self._popup_windows = []
-            self._popup_windows.append(window)
-            
-            def cleanup_window_reference(widget):
-                try:
-                    if hasattr(self, '_popup_windows'):
-                        if window in self._popup_windows:
-                            self._popup_windows.remove(window)
-                except Exception:
-                    pass           
-            window.connect("destroy", cleanup_window_reference)
-            window.present()
+                window.connect("destroy", on_popup_destroy)
+                window._vbox = vbox
+                window.present()
+                return window
         except Exception:
-            pass
+            return None
 
     def load_html_with_bootstrap(self, html):
-        """
-        Load HTML content into the current webview with Bootstrap CSS linked in the head.
-        If Bootstrap CSS link is not present, it will be injected.
-        """
-        try:
-            webview = self.get_current_webview()
-            if not webview:
-                return
-        except Exception:
-            pass
+        webview = self.get_current_webview()
+        if not webview:
+            return
 
     def inject_css_adblock(self):
-        """Inject CSS to hide ad elements."""
-        try:
-            css = """
-                div[class*="ad"]:not(.player-container, #player, .controls) {
-                    display: none !important;
-                }
-            """
-            style = WebKit.UserStyleSheet.new(
-                css,
-                WebKit.UserContentInjectedFrames.TOP_FRAME,
-                WebKit.UserStyleSheetLevel.USER,
-                [], []
-            )
-            self.content_manager.add_style_sheet(style)
-        except Exception:
-            pass
+        css = """
+            div[class*="ad"]:not(.player-container, #player, .controls) {
+                display: none !important;
+            }
+        """
+        style = WebKit.UserStyleSheet.new(
+            css,
+            WebKit.UserContentInjectedFrames.TOP_FRAME,
+            WebKit.UserStyleSheetLevel.USER,
+            [], []
+        )
+        self.content_manager.add_style_sheet(style)
 
     def inject_adware_cleaner(self):
-        """Enhanced ad-blocker that preserves media players while blocking ads."""
         script_source = """
         (function() {
             // Media player selectors to preserve
@@ -4078,18 +4960,14 @@ class ShadowBrowser(Gtk.Application):
             });
         })();
         """
-        try:
-            script = WebKit.UserScript.new(
-                script_source,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit.UserScriptInjectionTime.END,
-            )
-            self.content_manager.add_script(script)
-        except Exception:
-            pass
+        script = WebKit.UserScript.new(
+            script_source,
+            WebKit.UserContentInjectedFrames.ALL_FRAMES,
+            WebKit.UserScriptInjectionTime.END,
+        )
+        self.content_manager.add_script(script)
 
     def inject_remove_malicious_links(self):
-        """Inject malicious link remover JavaScript."""
         script_source = """
         // Remove or neutralize potentially malicious links
         function sanitizeLinks() {
@@ -4100,24 +4978,20 @@ class ShadowBrowser(Gtk.Application):
                 link.href = '#';
                 link.title = 'Potentially harmful link blocked';
             });
-        }       
+        }
         // Run on page load and when DOM changes
         document.addEventListener('DOMContentLoaded', sanitizeLinks);
         const observer = new MutationObserver(sanitizeLinks);
         observer.observe(document.body, { childList: true, subtree: true });
-        """        
-        try:
-            script = WebKit.UserScript.new(
+        """
+        script = WebKit.UserScript.new(
                 script_source,
                 WebKit.UserContentInjectedFrames.ALL_FRAMES,
                 WebKit.UserScriptInjectionTime.END,
             )
-            self.content_manager.add_script(script)
-        except Exception:
-            pass
+        self.content_manager.add_script(script)
 
     def inject_nonce_respecting_script(self):
-        """Inject nonce-respecting script for CSP compatibility."""
         script_source = """
         // This script respects CSP nonce if present
         (function() {
@@ -4127,33 +5001,25 @@ class ShadowBrowser(Gtk.Application):
                 if (nonce) {
                     const meta = document.createElement('meta');
                     meta.httpEquiv = "Content-Security-Policy";
-                    meta.content = `script-src 'nonce-${nonce}' 'strict-dynamic' 'unsafe-inline' 'self'`;
+                    meta.content = `script-src 'nonce-${nonce}' 'strict-dynamic' 'unsafe-inline'`;
                     document.head.appendChild(meta);
                 }
             }
         })();
-        """        
-        try:
-            script = WebKit.UserScript.new(
+        """
+        script = WebKit.UserScript.new(
                 script_source,
                 WebKit.UserContentInjectedFrames.ALL_FRAMES,
                 WebKit.UserScriptInjectionTime.START,
             )
-            self.content_manager.add_script(script)
-        except Exception:
-            pass
+        self.content_manager.add_script(script)
 
     def disable_biometrics_in_webview(self, webview):
         """
-        Injects JavaScript into the WebKitGTK WebView to block WebAuthn biometric prompts.
-        This disables navigator.credentials.get/create with publicKey options.
-        """
-        try:
-            script = """
-            (function() {
-                if (navigator.credentials) {
-                    const originalGet = navigator.credentials.get;
-                    const originalCreate = navigator.credentials.create;
+        (function() {
+            if (navigator.credentials) {
+                const originalGet = navigator.credentials.get;
+                const originalCreate = navigator.credentials.create;
                     navigator.credentials.get = function(options) {
                         if (options && options.publicKey) {
                             console.warn("[WebAuthn Blocked] navigator.credentials.get intercepted");
@@ -4171,46 +5037,28 @@ class ShadowBrowser(Gtk.Application):
                 }
             })();
             """
-            user_script = WebKit.UserScript.new(
-                script,
-                WebKit.UserContentInjectedFrames.TOP_FRAME,
-                WebKit.UserScriptInjectionTime.START,
-                [], []
-            )
-            webview.get_user_content_manager().add_script(user_script)
-        except Exception:
-            pass
 
     def block_biometric_apis(self, webview: WebKit.WebView):
-        """
-        Blocks WebAuthn biometric APIs and navigator.sendBeacon() in WebKitGTK browser.        
-        This method injects JavaScript to prevent fingerprinting through WebAuthn and
-        blocks the sendBeacon API which can be used for tracking. It provides a clean
-        rejection message without cluttering the console with warnings.       
-        Args:
-            webview: The WebKit.WebView instance to apply the blocking to
-        """
-        try:
-            if not webview or not hasattr(webview, 'get_user_content_manager'):
-                return                
-            script = """
-            (function() {
-                // Block WebAuthn
-                if (navigator.credentials) {
+        if not webview or not hasattr(webview, 'get_user_content_manager'):
+            return
+        script = """
+        (function() {
+            // Block WebAuthn
+            if (navigator.credentials) {
                     const originalGet = navigator.credentials.get;
-                    const originalCreate = navigator.credentials.create;                   
+                    const originalCreate = navigator.credentials.create;
                     // Store original console.warn to suppress our own messages
                     const originalWarn = console.warn;
-                    const originalError = console.error;                   
+                    const originalError = console.error;
                     // Only show our warning once per page load
-                    let warningShown = false;                
+                    let warningShown = false;
                     // Function to show warning only once
                     function showWarningOnce(message) {
                         if (!warningShown) {
                             originalWarn.call(console, "[Shadow Browser] " + message);
                             warningShown = true;
                         }
-                    }                   
+                    }
                     // Override credentials.get
                     navigator.credentials.get = function(options) {
                         if (options && options.publicKey) {
@@ -4223,7 +5071,7 @@ class ShadowBrowser(Gtk.Application):
                             );
                         }
                         return originalGet.apply(this, arguments);
-                    };                    
+                    };
                     // Override credentials.create
                     navigator.credentials.create = function(options) {
                         if (options && options.publicKey) {
@@ -4236,257 +5084,64 @@ class ShadowBrowser(Gtk.Application):
                             );
                         }
                         return originalCreate.apply(this, arguments);
-                    };                   
+                    };
                     // Restore original console methods
                     Object.defineProperty(console, 'warn', {
                         value: originalWarn,
                         writable: false,
                         configurable: false
-                    });                   
+                    });
                     Object.defineProperty(console, 'error', {
                         value: originalError,
                         writable: false,
                         configurable: false
                     });
-                }               
+                }
                 // Block navigator.sendBeacon silently
                 const originalSendBeacon = navigator.sendBeacon;
                 navigator.sendBeacon = function() {
                     // Silently block without logging to avoid console spam
                     return false;
-                };                
+                };
                 // Make it harder to detect our sendBeacon override
                 Object.defineProperty(navigator, 'sendBeacon', {
                     value: navigator.sendBeacon,
                     writable: false,
                     configurable: false
-                });               
+                });
             })();
-            """           
-            try:
-                user_script = WebKit.UserScript.new(
+            """
+        user_script = WebKit.UserScript.new(
                     script,
                     WebKit.UserContentInjectedFrames.ALL_FRAMES,
                     WebKit.UserScriptInjectionTime.START,
                     [],
                     []
-                )               
-                content_manager = webview.get_user_content_manager()               
-                content_manager.remove_all_scripts()               
-                content_manager.add_script(user_script)               
-            except Exception:
-                pass
-        except Exception:
-            pass
+                )
+        content_manager = webview.get_user_content_manager()
+        content_manager.remove_all_scripts()
+        content_manager.add_script(user_script)
 
     def inject_anti_fingerprinting_script(self, user_content_manager):
-        """Inject anti-fingerprinting JavaScript."""
-        script = """
-        (function() {
-            try {
-                Object.defineProperty(navigator, 'userAgent', { get: function() { return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.93 Safari/537.36'; } });
-                Object.defineProperty(navigator, 'platform', { get: function() { return 'Linux x86_64'; } });
-                Object.defineProperty(navigator, 'hardwareConcurrency', { get: function() { return 4; } });
-                Object.defineProperty(navigator, 'deviceMemory', { get: function() { return 8; } });
-                Object.defineProperty(navigator, 'plugins', { get: function() { return []; } });
-                Object.defineProperty(navigator, 'webdriver', { get: function() { return false; } });
-                Object.defineProperty(navigator, 'getBattery', { get: function() { return function() { return Promise.resolve({ charging: true, level: 1.0 }); }; } });
-                Object.defineProperty(navigator, 'geolocation', { get: function() { return { getCurrentPosition: function() {}, watchPosition: function() {} }; } });
-            } catch (e) {
-                console.log('Anti-fingerprinting script error:', e);
-            }
-        })();
-        """    
-        try:
-            user_script = WebKit.UserScript.new(
-                script,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit.UserScriptInjectionTime.START,
-                None, None
-            )
-            user_content_manager.add_script(user_script)
-        except Exception:
-            pass
-        
-    def inject_js_router_fix(self, user_content_manager):
-        """Inject JavaScript to fix flawed JS routers and handle Next Episode links."""
-        script = """
-        (function() {
-            'use strict';           
-            // Router fix for Next Episode links
-            const RouterFix = {
-                init: function() {
-                    this.fixHistoryAPI();
-                    this.fixPushState();
-                    this.fixReplaceState();
-                    this.fixNextEpisodeLinks();
-                    this.setupMutationObserver();
-                    this.fixHashChange();
-                },                
-                fixHistoryAPI: function() {
-                    const originalPushState = history.pushState;
-                    const originalReplaceState = history.replaceState;                    
-                    history.pushState = function(state, title, url) {
-                        console.log('[RouterFix] pushState intercepted:', url);
-                        const result = originalPushState.apply(this, arguments);
-                        RouterFix.handleRouteChange(url);
-                        return result;
-                    };                   
-                    history.replaceState = function(state, title, url) {
-                        console.log('[RouterFix] replaceState intercepted:', url);
-                        const result = originalReplaceState.apply(this, arguments);
-                        RouterFix.handleRouteChange(url);
-                        return result;
-                    };
-                },                
-                fixPushState: function() {
-                    // Fix for SPAs that use pushState incorrectly
-                    window.addEventListener('popstate', function(event) {
-                        console.log('[RouterFix] popstate event:', event.state);
-                        RouterFix.handleRouteChange(window.location.href);
-                    });
-                },                
-                fixReplaceState: function() {
-                    // Ensure replaceState updates the URL correctly
-                    const originalReplaceState = history.replaceState;
-                    history.replaceState = function(state, title, url) {
-                        if (url && typeof url === 'string') {
-                            // Ensure URL is properly formatted
-                            try {
-                                new URL(url, window.location.origin);
-                            } catch (e) {
-                                console.warn('[RouterFix] Invalid URL in replaceState:', url);
-                                return;
-                            }
-                        }
-                        return originalReplaceState.apply(this, arguments);
-                    };
-                },                
-                fixNextEpisodeLinks: function() {
-                    // Fix Next Episode links that use flawed JS routing
-                    const fixNextEpisode = function() {
-                        const nextEpisodeLinks = document.querySelectorAll('a[href*="next"], a[href*="episode"], .next-episode, .episode-next');                       
-                        nextEpisodeLinks.forEach(link => {
-                            // Store original href
-                            const originalHref = link.getAttribute('href');                            
-                            link.addEventListener('click', function(e) {
-                                console.log('[RouterFix] Next Episode link clicked:', originalHref);                                
-                                if (originalHref === '#' || originalHref.startsWith('javascript:')) {
-                                    e.preventDefault();                                    
-                                    const actualUrl = link.getAttribute('data-url') || 
-                                                     link.getAttribute('data-next') || 
-                                                     link.getAttribute('data-href');                                   
-                                    if (actualUrl) {
-                                        RouterFix.navigateTo(actualUrl);
-                                    } else {
-                                        const onclick = link.getAttribute('onclick');
-                                        if (onclick) {
-                                            const urlMatch = onclick.match(/['"]([^'"]+)['"]/);
-                                            if (urlMatch) {
-                                                RouterFix.navigateTo(urlMatch[1]);
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        });
-                    };
-                    fixNextEpisode();
-                },
-                navigateTo: function(url) {
-                    console.log('[RouterFix] Navigating to:', url);                    
-                    const absoluteUrl = new URL(url, window.location.origin).href;                    
-                    history.pushState({}, '', absoluteUrl);                    
-                    window.dispatchEvent(new CustomEvent('routerfix:navigate', {
-                        detail: { url: absoluteUrl }
-                    }));                    
-                    window.dispatchEvent(new PopStateEvent('popstate', {
-                        state: { url: absoluteUrl }
-                    }));
-                },               
-                handleRouteChange: function(url) {
-                    console.log('[RouterFix] Route changed to:', url);                    
-                    setTimeout(() => {
-                        RouterFix.fixNextEpisodeLinks();
-                    }, 100);
-                },                
-                setupMutationObserver: function() {
-                    const observer = new MutationObserver(function(mutations) {
-                        mutations.forEach(function(mutation) {
-                            if (mutation.type === 'childList') {
-                                mutation.addedNodes.forEach(function(node) {
-                                    if (node.nodeType === 1) {
-                                        const elements = [node, ...node.querySelectorAll('*')];
-                                        for (const el of elements) {
-                                            const text = (el.textContent || '').toLowerCase().trim();
-                                            if (text.includes('next') || text.includes('episode')) {
-                                                RouterFix.fixNextEpisodeLinks();
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                    });                    
-                    observer.observe(document.body, { childList: true, subtree: true });
-                },                
-                fixHashChange: function() {
-                    window.addEventListener('hashchange', function() {
-                        console.log('[RouterFix] Hash changed:', window.location.hash);
-                        RouterFix.handleRouteChange(window.location.href);
-                    });
-                }
-            };            
-            if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', RouterFix.init);
-            } else {
-                RouterFix.init();
-            }           
-            window.RouterFix = RouterFix;            
-            console.log('[RouterFix] JavaScript router fix loaded');
-        })();
+        dnt_script = """
+        Object.defineProperty(navigator, 'doNotTrack', {
+            get: function() { return '1'; }
+        });
         """
-        try:
-            user_script = WebKit.UserScript.new(
-                script,
-                WebKit.UserContentInjectedFrames.ALL_FRAMES,
-                WebKit.UserScriptInjectionTime.START,
-                None, None
-            )
-            user_content_manager.add_script(user_script)
-            print("JavaScript router fix injected successfully")
-        except Exception:
-            pass
-            
-    def DNT(self):
-        """Inject Do Not Track header."""
-        try:
-            dnt_script = """
-            Object.defineProperty(navigator, 'doNotTrack', {
-                get: function() { return '1'; }
-            });
-            """
-            user_script = WebKit.UserScript.new(
-                dnt_script,
-                WebKit.UserContentInjectedFrames.TOP_FRAME,
-                WebKit.UserScriptInjectionTime.START,
-                [], []
-            )
-            webview = self.get_current_webview()
-            if webview:
-                content_manager = webview.get_user_content_manager()
-                content_manager.add_script(user_script)
-        except Exception:
-            pass
-          
+        user_script = WebKit.UserScript.new(
+            dnt_script,
+            WebKit.UserContentInjectedFrames.TOP_FRAME,
+            WebKit.UserScriptInjectionTime.START,
+            [], []
+        )
+        webview = self.get_current_webview()
+        if webview:
+            content_manager = webview.get_user_content_manager()
+            content_manager.add_script(user_script)
+
     def _create_http_session(self):
-        """
-        Create a configured requests session with retries, timeouts, and optional Tor routing.        
-        Returns:
-            requests.Session: Configured session object
-        """
+        session = requests.Session()
         try:
-            session = requests.Session()
             session.headers.update({
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -4499,40 +5154,475 @@ class ShadowBrowser(Gtk.Application):
                 'Sec-Fetch-Mode': 'navigate',
                 'Sec-Fetch-Site': 'none',
                 'Sec-Fetch-User': '?1'
-            })           
+            })
             retry_strategy = Retry(
                 total=3,
                 backoff_factor=1,
                 status_forcelist=[408, 429, 500, 502, 503, 504],
                 allowed_methods=["GET", "POST", "HEAD", "OPTIONS"],
                 raise_on_status=False
-            )           
+            )
             adapter = HTTPAdapter(
                 max_retries=retry_strategy,
                 pool_connections=10,
-                pool_maxsize=10
+                pool_maxsize=10,
+                pool_block=False
             )
             session.mount("http://", adapter)
             session.mount("https://", adapter)
-            session.timeout = 30            
-            if self.tor_enabled and hasattr(self, 'tor_manager') and self.tor_manager.is_running():
-                proxy_url = f'socks5h://127.0.0.1:{self.tor_manager.tor_port}'
-                session.proxies = {
-                    'http': proxy_url,
-                    'https': proxy_url
-                }               
+            if self.tor_enabled and hasattr(self, 'tor_manager'):
                 try:
-                    test_url = 'https://check.torproject.org/api/ip'
-                    response = session.get(test_url, timeout=10)
-                    if 'IsTor' not in response.json().get('IsTor', ''):
+                    if not self.tor_manager.is_running():
+                        self.tor_manager.start()
+                    if self.tor_manager.is_running():
+                        proxy_url = f'socks5h://127.0.0.1:{self.tor_manager.tor_port}'
+                        session.proxies = {
+                            'http': proxy_url,
+                            'https': proxy_url
+                        }
+                        response = session.get(
+                            'https://check.torproject.org/api/ip',
+                            timeout=15
+                        )
+                        response.raise_for_status()
+                        if not response.json().get('IsTor', False):
+                            self.tor_enabled = False
+                            session.proxies = {}
+                    else:
                         self.tor_enabled = False
                 except Exception:
-                    pass            
-            return session            
-        except ImportError:
-            pass
+                    self.tor_enabled = False
+                    session.proxies = {}
+            return session
+        except Exception:
+            session.close()
+            raise
+
+    def initialize(self):
+        if self._gst_initialized:
+            return True
+        try:
+            if not self.Gst.init_check(None):
+                error = self.Gst.init_get_error()
+                if error:
+                    return False
+                try:
+                    self.Gst = Gst
+                    self.GLib = GLib
+                    self.GObject = GObject
+                except (ImportError, ValueError):
+                    return False
+            required_plugins = [
+                'playbin', 'h264parse', 'h265parse', 'videoconvert', 'audioconvert'
+            ]
+            missing_plugins = []
+            registry = self.Gst.Registry.get()
+            for plugin in required_plugins:
+                try:
+                    feature = registry.lookup_feature(plugin)
+                    if not feature:
+                        missing_plugins.append(plugin)
+                except (TypeError, AttributeError):
+                    try:
+                        feature = registry.lookup_feature(plugin.encode('utf-8'))
+                        if not feature:
+                            missing_plugins.append(plugin)
+                    except Exception:
+                        missing_plugins.append(plugin)
+            if missing_plugins:
+                return False
+            self._gst_initialized = True
+            return True
+        except Exception:
+            return False
+
+    def load_page(self):
+        self.webview.load_uri(self.url)
+        time.sleep(random.uniform(2, 5))
+
+    def navigate_to(self, path):
+        new_url = f"{self.url.rstrip('/')}/{path.lstrip('/')}"
+        self.webview.load_uri(new_url)
+        time.sleep(random.uniform(2, 5))
+
+    def get_favicon_(self, url):
+        if not url:
+            return None
+        with self.favicon_lock:
+            if url in self.favicon_cache:
+                return self.favicon_cache[url]
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        favicon_url = f"{parsed.scheme}://{parsed.netloc.rstrip('/')}/favicon.ico"
+        try:
+            response = requests.get(favicon_url, timeout=5)
+            if response.status_code == 200 and response.content:
+                texture = self._texture_from_bytes(response.content)
+                if texture:
+                    with self.favicon_lock:
+                        self.favicon_cache[url] = texture
+                    return texture
+        except Exception:
+            return None
+
+    def _get_favicon_cache_path(self, url):
+        cache_dir = os.path.join(os.path.expanduser("~"), ".shadowbrowser", "favicons")
+        os.makedirs(cache_dir, exist_ok=True)
+        filename = hashlib.sha1(url.encode("utf-8")).hexdigest() + ".png"
+        return os.path.join(cache_dir, filename)
+
+    def _load_cached_favicon(self, url):
+        cache_path = self._get_favicon_cache_path(url)
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "rb") as f:
+                    return self._texture_from_bytes(f.read())
+            except Exception:
+                return None
+        return None
+
+    def _texture_from_bytes(self, data):
+        if not data:
+            return None
+        if not isinstance(data, GLib.Bytes):
+            data = GLib.Bytes.new(data)
+        try:
+            return Gdk.Texture.new_from_bytes(data)
         except Exception:
             pass
+        try:
+            raw = data.get_data()
+            if not raw:
+                return None
+            length = len(raw)
+            if length % 4 != 0:
+                return None
+            pixels = length // 4
+            size = int(pixels ** 0.5)
+            if size * size * 4 != length:
+                return None
+            stride = size * 4
+            return Gdk.MemoryTexture.new(
+                size,
+                size,
+                Gdk.MemoryFormat.R8G8B8A8_PREMULTIPLIED,
+                data,
+                stride
+            )
+        except Exception:
+            return None
+
+    def _save_favicon_to_cache(self, url, texture_or_data):
+        cache_path = self._get_favicon_cache_path(url)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        try:
+            if isinstance(texture_or_data, (bytes, bytearray)):
+                with open(cache_path, "wb") as f:
+                    f.write(texture_or_data)
+                return True
+            elif hasattr(texture_or_data, "get_bytes"):
+                gbytes = texture_or_data.get_bytes()
+                if gbytes:
+                    with open(cache_path, "wb") as f:
+                        f.write(gbytes.get_data())
+                    return True
+        except Exception:
+            return False
+
+    def get_favicon(self, url, callback=None):
+        if not url or not isinstance(url, str):
+            if callback:
+                GLib.idle_add(callback, None)
+            return None
+        cache_key = url.lower().strip()
+        with self.favicon_lock:
+            if cache_key in self.favicon_cache:
+                cached = self.favicon_cache[cache_key]
+                if cached is not None and callback:
+                    GLib.idle_add(callback, cached)
+                return cached
+        disk_cached = self._load_cached_favicon(cache_key)
+        if disk_cached:
+            with self.favicon_lock:
+                self.favicon_cache[cache_key] = disk_cached
+            if callback:
+                GLib.idle_add(callback, disk_cached)
+            return disk_cached
+
+        def load_favicon_async():
+            texture = self._load_favicon_async(url)
+            if texture:
+                with self.favicon_lock:
+                    self.favicon_cache[cache_key] = texture
+                if callback:
+                    GLib.idle_add(callback, texture)
+                return texture
+            return None
+        threading.Thread(target=load_favicon_async, daemon=True).start()
+        return None
+
+    def _on_favicon_loaded(self, cache_key, texture):
+        with self.favicon_lock:
+            if texture:
+                self.favicon_cache[cache_key] = texture
+                self._save_favicon_to_cache(cache_key, texture)
+        if hasattr(self, '_pending_favicon_callbacks'):
+            callbacks = self._pending_favicon_callbacks.pop(cache_key, [])
+            for callback in callbacks:
+                GLib.idle_add(callback, texture)
+
+    def _load_favicon_async(self, url, callback=None):
+        if not url:
+            if callback:
+                GLib.idle_add(callback, None)
+            return None
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            if callback:
+                GLib.idle_add(callback, None)
+            return None
+        domain = parsed.netloc[4:] if parsed.netloc.startswith("www.") else parsed.netloc
+        favicon_urls = [
+            f"https://www.google.com/s2/favicons?domain={domain}&sz=32",
+            f"{parsed.scheme}://{domain}/favicon.ico",
+            f"https://{domain}/favicon.ico",
+            f"{parsed.scheme}://{domain}/favicon.png",
+        ]
+        if parsed.scheme == "https":
+            favicon_urls.extend([
+                f"http://{domain}/favicon.ico",
+                f"http://{domain}/favicon.png",
+            ])
+        session = self._create_http_session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/91.0.4472.124 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        })
+        valid_content_types = {
+            "image/svg+xml", "image/svg", "image/webp", "image/png",
+            "image/x-icon", "image/vnd.microsoft.icon", "image/icon",
+            "image/ico", "image/jpeg", "image/jpg", "image/gif",
+            "application/ico", "application/x-ico", "application/octet-stream"
+        }
+
+        def try_next_favicon(index=0):
+            if index >= len(favicon_urls):
+                if callback:
+                    GLib.idle_add(callback, None)
+                return
+            favicon_url = favicon_urls[index]
+
+            def on_response(session, response):
+                try:
+                    if response.status_code != 200:
+                        raise Exception(f"HTTP {response.status_code}")
+                    content_type = response.headers.get("content-type", "").lower()
+                    if not any(x in content_type for x in valid_content_types):
+                        if not response.content.startswith((b"\x89PNG", b"GIF", b"\xff\xd8", b"<svg", b"<?xml", b"\x00\x00")):
+                            raise Exception("Invalid content type")
+                    data = response.content
+                    if not data:
+                        raise Exception("Empty response")
+                    texture = self._texture_from_bytes(data)
+                    if texture:
+                        try:
+                            cache_key = f"{parsed.scheme}://{parsed.netloc}"
+                            cache_path = self._get_favicon_cache_path(cache_key)
+                            with open(cache_path, "wb") as f:
+                                f.write(data)
+                        except Exception:
+                            pass
+                        if callback:
+                            GLib.idle_add(callback, texture)
+                        return
+                except Exception:
+                    pass
+                try_next_favicon(index + 1)
+
+            def make_request():
+                try:
+                    response = session.get(favicon_url, timeout=5, stream=False)
+                    GLib.idle_add(lambda: on_response(session, response))
+                except Exception:
+                    pass
+                    GLib.idle_add(lambda: try_next_favicon(index + 1))
+            threading.Thread(target=make_request, daemon=True).start()
+        try_next_favicon()
+
+    def _create_http_session(self):
+        if not hasattr(self, "_favicon_session"):
+            self._favicon_session = requests.Session()
+            self._favicon_session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.6099.129 Safari/537.36"
+                )
+            })
+        return self._favicon_session
+
+    def fetch_favicon(self, page_url, callback):
+        if not page_url or not page_url.startswith(("http://", "https://")):
+            GLib.idle_add(callback, None)
+            return
+        parsed = urllib.parse.urlparse(page_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        html = self.download_data(page_url)
+        candidates = []
+        if html:
+            text = html.decode("utf-8", errors="ignore")
+            for rel in ["icon", "shortcut icon", "apple-touch-icon"]:
+                for m in re.finditer(rf'<link[^>]+rel=["\']?(?:{rel})[^>]*href=["\']([^"\'>]+)', text, re.I):
+                    candidates.append(urllib.parse.urljoin(page_url, m.group(1)))
+        for p in ["/favicon.ico", "/favicon.png", "/apple-touch-icon.png"]:
+            candidates.append(urllib.parse.urljoin(base + "/", p))
+        for url in candidates:
+            data = self.download_data(url)
+            if not data:
+                continue
+            try:
+                gbytes = GLib.Bytes.new(data)
+                texture = Gdk.Texture.new_from_bytes(gbytes)
+                GLib.idle_add(callback, texture)
+                return
+            except Exception:
+                continue
+        GLib.idle_add(callback, None)
+
+    def download_data(self, url, timeout=8):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ShadowBrowser/1.0"})
+            return urllib.request.urlopen(req, timeout=timeout).read()
+        except Exception:
+            return None
+
+    def _set_fallback_favicon(self, tab):
+        try:
+            icon_theme = Gtk.IconTheme.get_for_display(self.get_display())
+            paintable = icon_theme.lookup_icon(
+                "web-browser-symbolic",
+                None,
+                16,
+                self.get_scale_factor(),
+                Gtk.TextDirection.NONE,
+                Gtk.IconLookupFlags.FORCE_SYMBOLIC
+            )
+            if paintable:
+                tab.favicon_widget.set_from_paintable(paintable)
+                tab.favicon = paintable
+        except Exception:
+            pass
+
+    def get_favicon_from_cache(self, url):
+        if not url or not isinstance(url, str):
+            return None
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        cache_key = f"{parsed.scheme}://{parsed.netloc}"
+        with self.favicon_lock:
+            tex = self.favicon_cache.get(cache_key)
+            if tex:
+                return tex
+        try:
+            disk_tex = self._load_cached_favicon(cache_key)
+            if disk_tex:
+                with self.favicon_lock:
+                    self.favicon_cache[cache_key] = disk_tex
+                return disk_tex
+        except Exception:
+            pass
+        session = self._create_http_session()
+        favicon_urls = [
+            f"https://www.google.com/s2/favicons?domain={parsed.netloc}&sz=32",
+            f"{parsed.scheme}://{parsed.netloc}/favicon.ico",
+            f"{parsed.scheme}://{parsed.netloc}/favicon.png",
+            f"{parsed.scheme}://{parsed.netloc}/favicon.jpg",
+        ]
+        valid_sig_prefixes = (
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF8",
+            b"<?xml",
+            b"<svg",
+            b"\x00\x00\x01\x00"
+        )
+        for fav_url in favicon_urls:
+            try:
+                r = session.get(fav_url, timeout=5)
+            except Exception:
+                continue
+            if r.status_code != 200:
+                continue
+            raw_bytes = r.content
+            if not raw_bytes:
+                continue
+            content_type = (r.headers.get("content-type") or "").lower()
+            if content_type and not any(x in content_type for x in ("image/", "application/octet-stream", "image/vnd.microsoft.icon")):
+                if not any(raw_bytes.startswith(sig) for sig in valid_sig_prefixes):
+                    continue
+            try:
+                tex = self._texture_from_bytes(raw_bytes)
+            except Exception:
+                tex = None
+            if tex:
+                with self.favicon_lock:
+                    self.favicon_cache[cache_key] = tex
+                try:
+                    cache_path = self._get_favicon_cache_path(cache_key)
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    with open(cache_path, "wb") as f:
+                        f.write(raw_bytes)
+                except Exception:
+                    pass
+                return tex
+        return None
+
+    def _process_favicon_texture(self, favicon_data, url):
+        try:
+            cache_key = url
+            with self.favicon_lock:
+                cached = self.favicon_cache.get(cache_key)
+            if isinstance(cached, Gdk.Texture):
+                return cached
+            if isinstance(cached, (bytes, bytearray)):
+                tex = self._texture_from_bytes(cached)
+                if tex:
+                    with self.favicon_lock:
+                        self.favicon_cache[cache_key] = tex
+                    return tex
+            if favicon_data:
+                tex = self._texture_from_bytes(favicon_data)
+                if tex:
+                    with self.favicon_lock:
+                        self.favicon_cache[cache_key] = tex
+                    return tex
+            return None
+        except Exception:
+            pass
+            return None
+
+    def zoom_in(self):
+        current_webview = self.get_current_webview()
+        if current_webview:
+            current_zoom = current_webview.get_zoom_level()
+            current_webview.set_zoom_level(round(min(current_zoom + 0.1, 5.0), 1))
+
+    def zoom_out(self):
+        current_webview = self.get_current_webview()
+        if current_webview:
+            current_zoom = current_webview.get_zoom_level()
+            current_webview.set_zoom_level(round(max(current_zoom - 0.1, 0.25), 1))
+
+    def zoom_reset(self):
+        current_webview = self.get_current_webview()
+        if current_webview:
+            current_webview.set_zoom_level(1.0)
 
     def check_turnstile(self):
         script = """
@@ -4548,32 +5638,18 @@ class ShadowBrowser(Gtk.Application):
         self.webview.run_javascript(script, None, self.turnstile_callback, None)
 
     def turnstile_callback(self, webview, result, user_data):
-            js_result = webview.run_javascript_finish(result)
-            if js_result:
-                value = js_result.get_js_value()
-                if not value.is_null():
-                    pass
-                else:
-                    pass
+        js_result = webview.run_javascript_finish(result)
+        if js_result:
+            value = js_result.get_js_value()
+            if not value.is_null():
+                pass
+            else:
+                pass
 
-    def load_page(self):
-        self.webview.load_uri(self.url)
-        time.sleep(random.uniform(2, 5))
-
-    def navigate_to(self, path):
-        new_url = f"{self.url.rstrip('/')}/{path.lstrip('/')}"
-        self.webview.load_uri(new_url)
-        time.sleep(random.uniform(2, 5))
-       
 def main():
-    """Main entry point for the Shadow Browser."""
-    try:
-        app = ShadowBrowser()
-        return app.run(None)
-    except Exception as e:
-        print(f"Fatal error: {e}")
-        return 1
+    app = ShadowBrowser()
+    return app.run(sys.argv)
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    exit_code = main()
+    sys.exit(exit_code)
