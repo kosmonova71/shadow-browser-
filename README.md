@@ -1,6 +1,7 @@
 # Shadow Browser
 
-A privacy-focused web browser built with Python, GTK4, and WebKitGTK. Shadow Browser emphasizes security, privacy, and performance while providing a modern browsing experience.
+A privacy-focused web browser built with Python, GTK4, and WebKitGTK.
+Experimental Browser not recomended for daily use.
 
 ## Features
 
