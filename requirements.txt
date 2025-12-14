@@ -1,25 +1,18 @@
-# Core Dependencies
+# Core dependencies for Shadow Browser
 PyGObject>=3.42.0
-cryptography>=3.4.7
-requests>=2.26.0
-stem>=1.8.0  # For Tor support
-psutil>=5.9.0  # For process management in TorManager
-dbus-python
+cryptography>=41.0.0
+stem>=1.8.0
+requests>=2.31.0
+urllib3>=2.0.0
 
-# Optional: JavaScript obfuscation modules (custom/local modules)
-# These are optional and the application will work without them
-# js_obfuscation_improved
-# js_obfuscation
+# Additional dependencies
+psutil>=5.9.0
+PyYAML>=6.0.0
+typing-extensions>=4.0.0
 
-# System Dependencies (install via package manager):
-# For GStreamer support (optional, enhances media playback):
-# Ubuntu/Debian: sudo apt-get install gstreamer1.0-plugins-base gstreamer1.0-plugins-good
-# Fedora: sudo dnf install gstreamer1-plugins-base gstreamer1-plugins-good
-# Arch: sudo pacman -S gst-plugins-base gst-plugins-good
-
-# Development
-pytest>=6.2.5
-pytest-cov>=2.12.1
-black>=21.12b0
-flake8>=4.0.1
-mypy>=0.930
+# Optional dependencies for enhanced functionality
+# Pillow>=9.0.0  # For image processing
+# beautifulsoup4>=4.11.0  # For HTML parsing
+# lxml>=4.9.0  # For XML/HTML parsing
+# selenium>=4.0.0  # For web automation (optional)
+# pytest>=7.0.0  # For testing (development)
