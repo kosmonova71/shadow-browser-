@@ -1,233 +1,309 @@
-# ShadowBrowser
+# Shadow Browser
 
-A secure and private web browser built with Python, GTK 4, and WebKit.
+A privacy-focused web browser built with Python, GTK4, and WebKitGTK. Shadow Browser emphasizes security, privacy, and performance while providing a modern browsing experience.
 
 ## Features
 
-- **Privacy Focused**: Built with privacy in mind, blocking trackers and protecting your data
-- **Secure by Default**: Implements modern security practices and content security policies
-- **Lightweight**: Minimal resource usage compared to mainstream browsers
-- **Customizable**: Theme support and configurable settings
-- **Modern UI**: Clean, intuitive interface using GTK 4
-- **Biometric Protection**: Blocks WebAuthn and biometric authentication for enhanced privacy
-- **Anti-Fingerprinting**: Prevents tracking through browser fingerprinting techniques
-- **Download Manager**: Built-in download management with progress tracking
-- **Tor Integration**: Optional Tor support with status indicator
-- **Ad Blocking**: Advanced ad and tracker blocking using EasyList
-- **Media Optimization**: Enhanced support for video and audio playback
+- **Privacy & Security**: Built-in ad-blocker, SSL certificate validation, and enhanced security controls
+- **Modern UI**: Clean GTK4 interface with tabbed browsing
+- **Download Management**: Robust download manager with progress tracking
+- **Session Management**: Automatic session saving and restoration
+- **Bookmarks & History**: Full bookmark and browsing history support
+- **Hardware Acceleration**: VAAPI support for video playback
+- **Tor Integration**: Optional Tor browsing capabilities
+- **Extensible**: Plugin architecture for custom extensions
 
 ## Requirements
 
 - Python 3.8+
-- GTK 4.0
+- GTK4
 - WebKitGTK 6.0
-- GStreamer (for media playback)
-- Python packages (automatically installed):
-  - PyGObject
-  - cryptography
-  - requests
-  - stem (for Tor support)
+- GStreamer 1.0
+- PyGObject 3.42.0+
+- cryptography 41.0.0+
+- stem 1.8.0+ (for Tor support)
+- requests 2.31.0+
+- urllib3 2.0.0+
 
 ## Installation
 
-### Linux (Debian/Ubuntu)
+### Ubuntu/Debian
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo apt-get install python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-webkit2-4.1 gir1.2-gstreamer-1.0
+python shadowbrowser.py
+```
 
-1. Install system dependencies:
-   ```bash
-   sudo apt update
-   sudo apt install python3-gi gir1.2-webkit2-4.0 gir1.2-gtk-4.0 gir1.2-gtksource-4 \
-                  gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good \
-                  gstreamer1.0-plugins-bad gstreamer1.0-libav
-   ```
+### Fedora/RHEL/CentOS
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo dnf install python3-gobject python3-cairo gtk4 webkitgtk6 gstreamer1 gstreamer1-plugins-good
+python shadowbrowser.py
+```
 
-2. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/shadowbrowser.git
-   cd shadowbrowser
-   ```
+### Arch Linux
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo pacman -S python-gobject gtk4 webkit2gtk-4.1 gstreamer gst-plugins-good
+python shadowbrowser.py
+```
 
-3. Install Python dependencies:
-   ```bash
-   pip install --user -r requirements.txt
-   ```
+### openSUSE
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo zypper install python3-gobject python3-cairo gtk4 webkitgtk6 gstreamer gstreamer-plugins-good
+python shadowbrowser.py
+```
 
-4. (Optional) Run the setup script to create a desktop entry:
-   ```bash
-   python setup.py
-   ```
+### macOS
+```bash
+# Install Homebrew if not already installed
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-### Linux (Fedora)
+# Install dependencies
+brew install python@3.11 gtk4 webkit2gtk gstreamer gst-plugins-good
 
-1. Install system dependencies:
-   ```bash
-   sudo dnf install python3-gobject webkit2gtk4.0 gtk4 gtksourceview4 \
-                   gstreamer1 gstreamer1-plugins-good gstreamer1-plugins-bad \
-                   gstreamer1-plugins-libav
-   ```
+# Clone and run
+git clone <repository-url>
+cd shadowbrowser
+pip3 install -r requirements.txt
+python3 shadowbrowser.py
+```
 
-2. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/shadowbrowser.git
-   cd shadowbrowser
-   ```
+### Windows
+```bash
+# Install MSYS2 from https://www.msys2.org/
 
-3. Install Python dependencies:
-   ```bash
-   pip install --user -r requirements.txt
-   ```
+# In MSYS2 terminal:
+pacman -Syu
+pacman -S mingw-w64-x86_64-python3 mingw-w64-x86_64-gtk4 mingw-w64-x86_64-webkit2gtk-4.1 mingw-w64-x86_64-gstreamer mingw-w64-x86_64-gst-plugins-good
 
-4. (Optional) Run the setup script to create a desktop entry:
-   ```bash
-   python setup.py
-   ```
+# Clone and run:
+git clone <repository-url>
+cd shadowbrowser
+python -m pip install -r requirements.txt
+python shadowbrowser.py
+```
 
-### Linux (Arch Linux)
+### Solus
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo eopkg install python3-gobject python3-cairo gtk4 webkit2gtk-4.1 gstreamer gstreamer-plugins-good
+python shadowbrowser.py
+```
 
-1. Install system dependencies:
-   ```bash
-   sudo pacman -S python-gobject webkit2gtk gtk4 gtksourceview4 \
-                 gstreamer gst-plugins-good gst-plugins-bad gst-libav
-   ```
+### Void Linux
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo xbps-install -S python3-gobject python3-cairo gtk4 webkit2gtk-4.1 gstreamer1 gst-plugins-good1
+python shadowbrowser.py
+```
 
-2. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/shadowbrowser.git
-   cd shadowbrowser
-   ```
+### Alpine Linux
+```bash
+git clone <repository-url>
+cd shadowbrowser
+pip install -r requirements.txt
+sudo apk add py3-gobject3 py3-cairo gtk4 webkit2gtk-4.1 gstreamer gst-plugins-good
+python shadowbrowser.py
+```
 
-3. Install Python dependencies:
-   ```bash
-   pip install --user -r requirements.txt
-   ```
+## Configuration
 
-4. (Optional) Run the setup script to create a desktop entry:
-   ```bash
-   python setup.py
-   ```
+Shadow Browser uses a YAML configuration file located at `~/.config/shadowbrowser/config.yaml`. The configuration includes:
+
+- Cache settings (size, location)
+- Network preferences (user agent, timeouts)
+- Security options (JavaScript, plugins, WebGL)
+- UI settings (window size, zoom level, dark mode)
+- Extension preferences
+- GStreamer hardware acceleration options
 
 ## Usage
 
-### Running the Browser
+### Basic Navigation
+- Use the address bar to enter URLs
+- Navigate with back/forward buttons
+- Open new tabs with Ctrl+T
 
+### Privacy Features
+- Ad-blocking is enabled by default using EasyList
+- SSL certificate validation warns about expired or invalid certificates
+- Enhanced tracking protection
+
+### Downloads
+- Downloads are automatically saved to your Downloads folder
+- Progress bars show download status
+- Download history is maintained
+
+### Bookmarks & History
+- Bookmark pages with Ctrl+D
+- View browsing history with Ctrl+H
+- Bookmarks and history are automatically saved
+
+## Security Features
+
+- **SSL Certificate Validation**: Checks certificate expiration and validity
+- **Content Security Policy**: Enforces strict CSP headers
+- **Ad Blocking**: Blocks ads and trackers using EasyList
+- **JavaScript Control**: Configurable JavaScript execution
+- **Plugin Management**: Controlled plugin activation
+
+## Tor Integration
+
+Shadow Browser includes optional Tor support through the `torbrowser.py` module. To use Tor browsing:
+
+1. Ensure Tor is installed and running
+2. Launch with Tor mode:
 ```bash
-python -m browser
+python torbrowser.py
 ```
-
-### Command Line Options
-
-- `--new-window`: Open in a new window
-- `--new-tab`: Open in a new tab
-- `--private`: Start in private browsing mode
-- `--help`: Show help message
-- `--version`: Show version information
-
-### Keyboard Shortcuts
-
-- `Ctrl+T`: New tab
-- `Ctrl+W`: Close current tab
-- `Ctrl+Tab`: Next tab
-- `Ctrl+Shift+Tab`: Previous tab
-- `Ctrl+L`: Focus address bar
-- `F5` or `Ctrl+R`: Reload page
-- `Ctrl+H`: Show history
-- `Ctrl+B`: Show bookmarks
-- `Ctrl+D`: Add current page to bookmarks
-- `Ctrl+Q`: Quit
-
-## Download Manager
-
-ShadowBrowser includes a built-in download manager that provides:
-
-- **Progress Tracking**: Real-time download progress with speed and ETA
-- **Resume Support**: Ability to pause and resume downloads
-- **Security Checks**: Automatic scanning for malicious content
-- **Organization**: Downloads are organized by type and date
-- **Integration**: Seamless integration with the browser interface
-
-Downloads can be managed directly from the browser's download panel, accessible from the menu bar.
-
-## Settings and Configuration
-
-The browser includes a settings dialog accessible from the menu, allowing you to:
-
-- Configure privacy and security options
-- Manage ad blocking and tracker lists
-- Enable or disable Tor integration
-- Customize themes and appearance
-- Set keyboard shortcuts and behavior
-- Manage downloads and media playback options
-
-Use the settings dialog to tailor the browser to your preferences and enhance your browsing experience.
-
-## Features
-
-### Privacy
-
-- Built-in ad and tracker blocking
-- Third-party cookie blocking
-- Fingerprinting protection
-- Secure DNS (with support for DNS-over-HTTPS)
-- Tor integration (optional)
-
-### Security
-
-- Content Security Policy (CSP) support
-- HTTP Strict Transport Security (HSTS)
-- Mixed content blocking
-- Certificate pinning
-- Secure password management
-- WebAuthn and biometric authentication blocking
-- Enhanced ad and tracker blocking using EasyList
-- Anti-fingerprinting measures
-- Tor integration with status indicator and control
-
-### Customization
-
-- Light and dark themes
-- Custom CSS support
-- Extensible architecture
-- Configurable user agent
 
 ## Development
 
 ### Project Structure
+- `shadowbrowser.py` - Main browser application
+- `config.py` - Configuration management
+- `utils.py` - Utility functions
+- `vaapi_manager.py` - Hardware acceleration management
+- `js_obfuscation_improved.py` - JavaScript handling utilities
+- `test_*.py` - Test files
 
+### Testing
+Run tests with:
+```bash
+python test.py
+python test_blocking.py
+python test_webkitgtk_fixes.py
 ```
-shadowbrowser/
-├── browser/               # Main package
-│   ├── core/              # Core functionality
-│   │   ├── __init__.py
-│   │   ├── window.py      # Main window implementation
-│   │   └── tabs.py        # Tab management
-│   ├── shadow/            # Shadow submodule with enhanced features
-│   │   ├── __init__.py
-│   │   └── shadowbrowser.py
-│   ├── __main__.py        # Application entry point
-│   └── __init__.py
-├── config.py             # Configuration and constants
-├── logger.py             # Logging configuration
-├── security.py           # Security utilities
-├── rate_limiter.py       # Rate limiting
-├── setup.py              # Installation script
-└── README.md             # This file
-```
-### Project Structure
 
-
-### Contributing
+## Contributing
 
 1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+2. Create a feature branch
+3. Make your changes
+4. Add tests for new functionality
+5. Submit a pull request
 
 ## License
 
-This project is licensed under the GPL-3.0 License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
 
-## Acknowledgments
+## Troubleshooting
 
-- WebKitGTK for the rendering engine
-- GTK for the UI toolkit
-- The Python community for awesome libraries
+### Common Issues
+
+**WebKitGTK not found**:
+- Ubuntu/Debian: `sudo apt-get install gir1.2-webkit2-4.1`
+- Fedora: `sudo dnf install webkitgtk6`
+- Arch: `sudo pacman -S webkit2gtk-4.1`
+- macOS: `brew install webkit2gtk`
+- Windows (MSYS2): `pacman -S mingw-w64-x86_64-webkit2gtk-4.1`
+
+**GTK4 not available**:
+- Ubuntu/Debian: `sudo apt-get install libgtk-4-dev gir1.2-gtk-4.0`
+- Fedora: `sudo dnf install gtk4`
+- Arch: `sudo pacman -S gtk4`
+- macOS: `brew install gtk4`
+- Windows (MSYS2): `pacman -S mingw-w64-x86_64-gtk4`
+
+**Python GI bindings missing**:
+- Ubuntu/Debian: `sudo apt-get install python3-gi python3-gi-cairo`
+- Fedora: `sudo dnf install python3-gobject python3-cairo`
+- Arch: `sudo pacman -S python-gobject`
+- macOS: `brew install python@3.11` (includes GI bindings)
+- Windows (MSYS2): `pacman -S mingw-w64-x86_64-python3`
+
+**GStreamer issues**:
+- Ubuntu/Debian: `sudo apt-get install gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good`
+- Fedora: `sudo dnf install gstreamer1 gstreamer1-plugins-good`
+- Arch: `sudo pacman -S gstreamer gst-plugins-good`
+- macOS: `brew install gstreamer gst-plugins-good`
+- Windows (MSYS2): `pacman -S mingw-w64-x86_64-gstreamer mingw-w64-x86_64-gst-plugins-good`
+
+**Hardware acceleration issues**:
+- Check VAAPI driver installation
+- Update graphics drivers
+- Disable hardware acceleration in config if needed
+
+### Platform-Specific Issues
+
+**macOS**:
+- If GTK fails to initialize, try: `export GTK_PATH=$(brew --prefix gtk4)/lib/gtk-4.0`
+- For display issues, ensure XQuartz is installed and running
+- Use `python3` instead of `python` to avoid system Python conflicts
+
+**Windows (MSYS2)**:
+- Run from MSYS2 MinGW 64-bit shell, not regular CMD/PowerShell
+- Ensure MSYS2 is updated: `pacman -Syu`
+- If fonts look wrong, install: `pacman -S mingw-w64-x86_64-fontconfig`
+
+**Linux (General)**:
+- For Wayland users, GTK4 should work natively
+- On X11, ensure X11 server is running properly
+- Check for missing theme packages if UI looks incorrect
+
+**Permission Issues**:
+- Ensure Python has access to create cache directories
+- Check permissions for `~/.config/shadowbrowser/` and `~/.cache/shadowbrowser/`
+
+### Debug Mode
+
+Enable debug logging by setting the log level in the configuration:
+```yaml
+logging:
+  level: DEBUG
+```
+
+## Configuration File Example
+
+```yaml
+cache:
+  directory: ~/.cache/shadowbrowser
+  max_size: 536870912  # 512MB
+  media_cache_size: 268435456  # 256MB
+
+network:
+  user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
+  timeout: 30
+  max_redirects: 10
+
+security:
+  enable_javascript: true
+  enable_plugins: false
+  enable_webgl: true
+  enable_webrtc: true
+  block_third_party_cookies: true
+
+ui:
+  default_width: 1280
+  default_height: 800
+  zoom_level: 1.0
+  dark_mode: true
+
+extensions:
+  adblock: true
+  privacy_badger: true
+  https_everywhere: true
+
+gstreamer:
+  enable_hardware_accel: true
+  vaapi_driver: iHD
+  debug_level: WARNING
+```
+
+## Support
+
+For issues, feature requests, or questions, please open an issue on the project repository.
